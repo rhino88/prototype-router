@@ -1,0 +1,19 @@
+[package]
+name = "prototype-router"
+version = "0.0.1"
+edition = "2021"
+description = "Prototype GraphQL federation gateway: greedy query planning with fetch merging"
+
+[[bin]]
+name = "prototype-router"
+path = "src/main.rs"
+
+[dependencies]
+async-graphql-parser = "7.0.17"
+async-graphql-value = "7.0.17"
+axum = "0.8.4"
+futures-util = "0.3"
+indexmap = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
