@@ -2,20 +2,32 @@
 //! greedy field assignment, then a pass that merges
 //! fetches so each subgraph is called at most once per step. See `plan.rs`.
 
+mod doc;
 mod plan;
 mod schema;
 
 use async_graphql_parser::types::{BaseType, Type};
-use axum::{extract::State, routing::post, Json, Router};
+use doc::{Doc, Id, ROOT};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::header::CONTENT_TYPE,
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use plan::{EField, EntityPart, Expanded, Group, Merge, Plan, RepField, RouteCache};
 use schema::{Kind, Schema};
 use serde_json::{json, Map, Value};
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 struct Gateway {
     schema: Schema,
@@ -24,87 +36,13 @@ struct Gateway {
     debug: bool,
     routes: RouteCache,
     plans: RwLock<HashMap<String, Arc<Plan>>>,
+    /// Queries being executed right now, by operation and variables. `None`
+    /// when `DEDUPE=off`.
+    flights: Option<Mutex<HashMap<String, Flight>>>,
 }
 
-#[derive(Clone)]
-enum Seg {
-    Key(String),
-    Index(usize),
-}
-
-fn get<'a>(mut value: &'a Value, pointer: &[Seg]) -> &'a Value {
-    for seg in pointer {
-        value = match seg {
-            Seg::Key(key) => &value[key.as_str()],
-            Seg::Index(index) => &value[*index],
-        };
-    }
-    value
-}
-
-fn get_mut<'a>(mut value: &'a mut Value, pointer: &[Seg]) -> &'a mut Value {
-    for seg in pointer {
-        value = match seg {
-            Seg::Key(key) => &mut value[key.as_str()],
-            Seg::Index(index) => &mut value[*index],
-        };
-    }
-    value
-}
-
-fn merge(schema: &Schema, target: &mut Value, source: Value) {
-    match (target, source) {
-        (Value::Object(target), Value::Object(source)) => {
-            for (key, value) in source {
-                match target.get_mut(&key) {
-                    Some(existing) => {
-                        // An interface object's name never replaces the
-                        // concrete type another subgraph has told us.
-                        if key == "__typename" && existing.is_string() {
-                            let concrete = value
-                                .as_str()
-                                .and_then(|t| schema.types.get(t))
-                                .is_some_and(|t| t.kind == Kind::Object);
-                            if !concrete {
-                                continue;
-                            }
-                        }
-                        merge(schema, existing, value)
-                    }
-                    None => {
-                        target.insert(key, value);
-                    }
-                }
-            }
-        }
-        (Value::Array(target), Value::Array(source)) if target.len() == source.len() => {
-            for (existing, value) in target.iter_mut().zip(source) {
-                merge(schema, existing, value);
-            }
-        }
-        // A subgraph that failed to resolve a field doesn't erase what
-        // another one returned for it.
-        (target, Value::Null) if !target.is_null() => {}
-        (target, source) => *target = source,
-    }
-}
-
-/// Puts fields the request had to alias back under their response keys.
-fn unalias(value: &mut Value) {
-    match value {
-        Value::Array(items) => items.iter_mut().for_each(unalias),
-        Value::Object(object) => {
-            if object.keys().any(|k| plan::unalias(k).len() != k.len()) {
-                *object = std::mem::take(object)
-                    .into_iter()
-                    .map(|(key, value)| (plan::unalias(&key).to_string(), value))
-                    .collect();
-            }
-            object.values_mut().for_each(unalias);
-        }
-        _ => {}
-    }
-}
+/// One execution that every identical concurrent query waits for.
+type Flight = Shared<BoxFuture<'static, Bytes>>;
 
 /// Whether an object with `typename` can be what a selection on `condition`
 /// applies to. Interface objects have the interface as their type until a
@@ -113,38 +51,29 @@ fn matches(schema: &Schema, typename: &str, condition: &str) -> bool {
     typename == condition || schema.subtype(typename, condition) || schema.subtype(condition, typename)
 }
 
-/// Finds every object at `path` in the response.
-fn locate(
-    schema: &Schema,
-    value: &Value,
-    path: &[(String, String)],
-    depth: usize,
-    current: &mut Vec<Seg>,
-    out: &mut Vec<Vec<Seg>>,
-) {
-    match value {
-        Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                current.push(Seg::Index(index));
-                locate(schema, item, path, depth, current, out);
-                current.pop();
+fn typename(doc: &Doc, object: Id) -> Option<&str> {
+    doc.get(object, "__typename").and_then(|t| doc.str(t))
+}
+
+/// Finds every object at `path` in the response. Only the fields on the path
+/// are followed.
+fn locate(schema: &Schema, doc: &Doc, node: Id, path: &[(String, String)], out: &mut Vec<Id>) {
+    match doc.kind(node) {
+        doc::Kind::Arr => {
+            for item in doc.children(node) {
+                locate(schema, doc, item, path, out);
             }
         }
-        Value::Object(object) => {
-            if depth == path.len() {
-                out.push(current.clone());
+        doc::Kind::Obj => {
+            let Some(((parent_type, key), rest)) = path.split_first() else {
+                out.push(node);
+                return;
+            };
+            if typename(doc, node).is_some_and(|t| !matches(schema, t, parent_type)) {
                 return;
             }
-            let (parent_type, key) = &path[depth];
-            if let Some(Value::String(typename)) = object.get("__typename") {
-                if !matches(schema, typename, parent_type) {
-                    return;
-                }
-            }
-            if let Some(child) = object.get(key) {
-                current.push(Seg::Key(key.clone()));
-                locate(schema, child, path, depth + 1, current, out);
-                current.pop();
+            if let Some(child) = doc.get(node, key) {
+                locate(schema, doc, child, rest, out);
             }
         }
         _ => {}
@@ -152,94 +81,135 @@ fn locate(
 }
 
 struct Prepared {
-    body: Value,
-    /// Per entity part: (where the entity is, index of its representation).
-    targets: Vec<Vec<(Vec<Seg>, usize)>>,
+    /// The request body, as JSON text.
+    body: Vec<u8>,
+    /// Per entity part: (the entity, index of its representation).
+    targets: Vec<Vec<(Id, usize)>>,
 }
 
-fn prepare(schema: &Schema, group: &Group, data: &Value, client: &Map<String, Value>) -> Option<Prepared> {
-    let mut variables = Map::new();
+fn prepare(schema: &Schema, group: &Group, doc: &Doc, client: &Map<String, Value>) -> Option<Prepared> {
+    let mut body = b"{\"query\":".to_vec();
+    serde_json::to_writer(&mut body, &group.query).unwrap();
+    body.extend_from_slice(b",\"variables\":{");
     let mut targets = Vec::new();
     let mut any = group.has_root;
+    // Parts for the same place share the search for it.
+    let mut located: Vec<(&[(String, String)], Vec<Id>)> = Vec::new();
 
     for (index, part) in group.entities.iter().enumerate() {
-        let (representations, part_targets) = representations(schema, part, data);
-        any |= !representations.is_empty();
-        variables.insert(format!("_r{}", index), Value::Array(representations));
-        targets.push(part_targets);
+        if index > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(format!("\"_r{}\":[", index).as_bytes());
+        let found = match located.iter().position(|(path, _)| *path == part.path.as_slice()) {
+            Some(found) => found,
+            None => {
+                let mut objects = Vec::new();
+                locate(schema, doc, ROOT, &part.path, &mut objects);
+                located.push((&part.path, objects));
+                located.len() - 1
+            }
+        };
+        let before = body.len();
+        targets.push(representations(schema, part, doc, &located[found].1, &mut body));
+        any |= body.len() > before;
+        body.push(b']');
     }
     if !any {
         return None;
     }
+    let mut first = group.entities.is_empty();
     for name in &group.vars {
         if let Some(value) = client.get(name) {
-            variables.insert(name.clone(), value.clone());
+            if !std::mem::take(&mut first) {
+                body.push(b',');
+            }
+            serde_json::to_writer(&mut body, name).unwrap();
+            body.push(b':');
+            serde_json::to_writer(&mut body, value).unwrap();
         }
     }
-    Some(Prepared {
-        body: json!({ "query": group.query, "variables": variables }),
-        targets,
-    })
+    body.extend_from_slice(b"}}");
+    Some(Prepared { body, targets })
 }
 
-/// Reads the fields of a representation off an object in the response.
-/// `false` if a field the entity is looked up by has no value.
-fn rep_fields(object: &Map<String, Value>, fields: &[RepField], out: &mut Map<String, Value>) -> bool {
-    for field in fields {
-        let value = match object.get(&field.key) {
-            None | Some(Value::Null) => {
-                if field.required {
-                    return false;
-                }
-                Value::Null
-            }
-            Some(value) => rep_value(value, field),
-        };
-        out.insert(field.name.clone(), value);
+/// Writes the fields of a representation, read off an object in the
+/// response. `false` if a field the entity is looked up by has no value.
+fn rep_fields(doc: &Doc, object: Id, fields: &[RepField], out: &mut Vec<u8>, first: &mut bool) -> bool {
+    for (index, field) in fields.iter().enumerate() {
+        let value = doc.get(object, &field.key).filter(|v| doc.kind(*v) != doc::Kind::Null);
+        if value.is_none() && field.required {
+            return false;
+        }
+        // Of two fields with one name, the later one is sent.
+        if fields[index + 1..].iter().any(|later| later.name == field.name) {
+            continue;
+        }
+        if !std::mem::take(first) {
+            out.push(b',');
+        }
+        out.push(b'"');
+        out.extend_from_slice(field.name.as_bytes());
+        out.extend_from_slice(b"\":");
+        match value {
+            None => out.extend_from_slice(b"null"),
+            Some(value) => rep_value(doc, value, field, out),
+        }
     }
     true
 }
 
-fn rep_value(value: &Value, field: &RepField) -> Value {
+fn rep_value(doc: &Doc, value: Id, field: &RepField, out: &mut Vec<u8>) {
     let Some(sub) = &field.sub else {
-        return value.clone();
+        return doc.write(value, out);
     };
-    match value {
-        Value::Array(items) => Value::Array(items.iter().map(|i| rep_value(i, field)).collect()),
-        Value::Object(object) => {
-            let typename = object.get("__typename").and_then(Value::as_str);
-            let mut out = Map::new();
+    match doc.kind(value) {
+        doc::Kind::Arr => {
+            out.push(b'[');
+            for (index, item) in doc.children(value).enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                rep_value(doc, item, field, out);
+            }
+            out.push(b']');
+        }
+        doc::Kind::Obj => {
+            let typename = typename(doc, value);
+            let mut first = true;
+            out.push(b'{');
             if let (true, Some(typename)) = (field.abstract_type, typename) {
-                out.insert("__typename".into(), Value::String(typename.to_string()));
+                out.extend_from_slice(b"\"__typename\":\"");
+                out.extend_from_slice(typename.as_bytes());
+                out.push(b'"');
+                first = false;
             }
             let fields = typename
                 .and_then(|t| sub.get(t))
                 .or_else(|| sub.values().next().filter(|_| sub.len() == 1));
             if let Some(fields) = fields {
-                rep_fields(object, fields, &mut out);
+                rep_fields(doc, value, fields, out, &mut first);
             }
-            Value::Object(out)
+            out.push(b'}');
         }
-        other => other.clone(),
+        _ => doc.write(value, out),
     }
 }
 
+/// Appends the representations of `entities` to `out`, separated by commas,
+/// and returns which representation is whose.
 fn representations(
     schema: &Schema,
     part: &EntityPart,
-    data: &Value,
-) -> (Vec<Value>, Vec<(Vec<Seg>, usize)>) {
-    let mut pointers = Vec::new();
-    locate(schema, data, &part.path, 0, &mut Vec::new(), &mut pointers);
-
-    let mut representations = Vec::new();
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut targets = Vec::new();
-    for pointer in pointers {
-        let Value::Object(entity) = get(data, &pointer) else {
-            continue;
-        };
-        let Some(Value::String(typename)) = entity.get("__typename") else {
+    doc: &Doc,
+    entities: &[Id],
+    out: &mut Vec<u8>,
+) -> Vec<(Id, usize)> {
+    let mut seen: schema::HashMap<Vec<u8>, usize> = Default::default();
+    let mut representation = Vec::new();
+    let mut targets = Vec::with_capacity(entities.len());
+    for &entity in entities {
+        let Some(typename) = typename(doc, entity) else {
             continue;
         };
         // Planned for this type, or for the interface object it started as.
@@ -251,33 +221,43 @@ fn representations(
         }) else {
             continue;
         };
-        let mut representation = Map::new();
-        representation.insert("__typename".into(), Value::String(spec.typename.clone()));
-        if !rep_fields(entity, &spec.fields, &mut representation) {
+        representation.clear();
+        representation.extend_from_slice(b"{\"__typename\":\"");
+        representation.extend_from_slice(spec.typename.as_bytes());
+        representation.push(b'"');
+        if !rep_fields(doc, entity, &spec.fields, &mut representation, &mut false) {
             continue;
         }
+        representation.push(b'}');
         // Identical representations are sent once.
-        let representation = Value::Object(representation);
-        let id = representation.to_string();
-        let index = *seen.entry(id).or_insert_with(|| {
-            representations.push(representation);
-            representations.len() - 1
-        });
-        targets.push((pointer, index));
+        let index = match seen.get(&representation) {
+            Some(index) => *index,
+            None => {
+                let index = seen.len();
+                if index > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&representation);
+                seen.insert(representation.clone(), index);
+                index
+            }
+        };
+        targets.push((entity, index));
     }
-    (representations, targets)
+    targets
 }
 
-async fn send(gateway: &Gateway, group: &Group, body: Value) -> Result<Value, String> {
+async fn send(gateway: &Gateway, group: &Group, body: Vec<u8>) -> Result<Bytes, String> {
     let subgraph = &gateway.schema.subgraphs[group.subgraph];
     gateway
         .client
         .post(&subgraph.url)
-        .json(&body)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
         .send()
         .await
         .map_err(|e| format!("{}: {}", subgraph.name, e))?
-        .json()
+        .bytes()
         .await
         .map_err(|e| format!("{}: {}", subgraph.name, e))
 }
@@ -285,10 +265,12 @@ async fn send(gateway: &Gateway, group: &Group, body: Value) -> Result<Value, St
 /// Runs the plan: a request is sent as soon as the responses it depends on
 /// have been merged, so a request never waits for one it doesn't need.
 /// A subgraph's errors are passed on and whatever it did return is used.
-async fn execute(gateway: &Gateway, plan: &Plan, variables: &Map<String, Value>) -> Value {
+/// Returns the response as JSON text.
+async fn execute(gateway: &Gateway, plan: &Plan, variables: &Map<String, Value>) -> Vec<u8> {
     let schema = &gateway.schema;
-    let mut data = Value::Object(Map::new());
+    let mut doc = Doc::new();
     let mut errors: Vec<Value> = Vec::new();
+    let concrete = |name: &str| schema.types.get(name).is_some_and(|t| t.kind == Kind::Object);
 
     let count = plan.groups.len();
     let mut waiting: Vec<usize> = plan.groups.iter().map(|g| g.deps.len()).collect();
@@ -304,7 +286,7 @@ async fn execute(gateway: &Gateway, plan: &Plan, variables: &Map<String, Value>)
     loop {
         while let Some(index) = ready.pop() {
             let group = &plan.groups[index];
-            match prepare(schema, group, &data, variables) {
+            match prepare(schema, group, &doc, variables) {
                 Some(prepared) => running.push(async move {
                     let response = send(gateway, group, prepared.body).await;
                     (index, prepared.targets, response)
@@ -324,36 +306,54 @@ async fn execute(gateway: &Gateway, plan: &Plan, variables: &Map<String, Value>)
         let Some((index, targets, response)) = running.next().await else {
             break;
         };
+        let group = &plan.groups[index];
+        let service = &schema.subgraphs[group.subgraph].name;
+        let response = response.and_then(|bytes| {
+            doc.parse(bytes, group.aliased).map_err(|e| format!("{}: {}", service, e))
+        });
         match response {
             Err(message) => errors.push(json!({ "message": message })),
-            Ok(mut response) => {
-                if let Some(Value::Array(failed)) = response.get_mut("errors").map(Value::take) {
-                    let service = &schema.subgraphs[plan.groups[index].subgraph].name;
-                    for error in failed {
-                        errors.push(json!({
-                            "message": error.get("message").cloned().unwrap_or(Value::Null),
-                            "extensions": { "service": service },
-                        }));
-                    }
+            Ok(response) => {
+                let failed = doc.get(response, "errors").filter(|e| doc.kind(*e) == doc::Kind::Arr);
+                for error in failed.into_iter().flat_map(|failed| doc.children(failed)) {
+                    let message = doc
+                        .get(error, "message")
+                        .and_then(|m| serde_json::from_str(&doc.to_string(m)).ok())
+                        .unwrap_or(Value::Null);
+                    errors.push(json!({ "message": message, "extensions": { "service": service } }));
                 }
-                if plan.groups[index].aliased {
-                    if let Some(data) = response.get_mut("data") {
-                        unalias(data);
-                    }
-                }
-                if let Some(Value::Object(mut result)) = response.get_mut("data").map(Value::take) {
-                    for (part, targets) in plan.groups[index].entities.iter().zip(targets) {
-                        let Some(Value::Array(entities)) = result.remove(&part.alias) else {
+                let result = doc.get(response, "data").filter(|d| doc.kind(*d) == doc::Kind::Obj);
+                if let Some(result) = result {
+                    for (part, targets) in group.entities.iter().zip(targets) {
+                        let entities = doc.get(result, &part.alias).filter(|e| doc.kind(*e) == doc::Kind::Arr);
+                        let Some(entities) = entities else {
                             continue;
                         };
-                        for (pointer, entity) in targets {
+                        let entities: Vec<Id> = doc.children(entities).collect();
+                        // The last place an entity goes takes it; the others
+                        // get copies.
+                        let mut last = vec![0; entities.len()];
+                        for (position, (_, entity)) in targets.iter().enumerate() {
+                            if let Some(last) = last.get_mut(*entity) {
+                                *last = position;
+                            }
+                        }
+                        for (position, (target, entity)) in targets.into_iter().enumerate() {
                             match entities.get(entity) {
-                                Some(Value::Null) | None => {}
-                                Some(entity) => merge(schema, get_mut(&mut data, &pointer), entity.clone()),
+                                Some(&node) if doc.kind(node) != doc::Kind::Null => {
+                                    doc.merge(target, node, last[entity] != position, &concrete)
+                                }
+                                _ => {}
                             }
                         }
                     }
-                    merge(schema, &mut data, Value::Object(result));
+                    let fields: Vec<Id> = doc.children(result).collect();
+                    for field in fields {
+                        let entities = group.entities.iter().any(|p| p.alias.as_bytes() == doc.key(field));
+                        if !entities {
+                            doc.merge_field(ROOT, field, false, &concrete);
+                        }
+                    }
                 }
             }
         }
@@ -365,61 +365,69 @@ async fn execute(gateway: &Gateway, plan: &Plan, variables: &Map<String, Value>)
         }
     }
 
-    let mut shaper = Shaper { schema, errors };
-    let data = match &data {
-        Value::Object(object) => shaper
-            .object(object, &plan.expanded, Some(plan.root))
-            .unwrap_or(Value::Null),
-        _ => Value::Null,
-    };
-    let mut response = Map::new();
-    response.insert("data".into(), data);
-    if !shaper.errors.is_empty() {
-        response.insert("errors".into(), Value::Array(shaper.errors));
+    let mut shaper = Shaper { schema, doc: &doc, errors, out: b"{\"data\":".to_vec() };
+    let start = shaper.out.len();
+    if shaper.object(ROOT, &plan.expanded, Some(plan.root)).is_err() {
+        shaper.out.truncate(start);
+        shaper.out.extend_from_slice(b"null");
     }
-    Value::Object(response)
+    if !shaper.errors.is_empty() {
+        shaper.out.extend_from_slice(b",\"errors\":");
+        serde_json::to_writer(&mut shaper.out, &shaper.errors).unwrap();
+    }
+    shaper.out.push(b'}');
+    shaper.out
 }
 
 /// Shapes the collected data into what the client asked for: its fields, in
 /// its order, without the fields the plan added, and valid for the schema the
-/// client sees. `Err` is a null in a non-null place on its way up to the
-/// nearest field that may be null.
+/// client sees. The result is written as JSON text straight into `out`.
+/// `Err` is a null in a non-null place on its way up to the nearest field
+/// that may be null, which takes back what was written for it.
 struct Shaper<'a> {
     schema: &'a Schema,
+    doc: &'a Doc,
     errors: Vec<Value>,
+    out: Vec<u8>,
 }
 
 struct Bubble;
 
 impl Shaper<'_> {
-    fn object(
-        &mut self,
-        object: &Map<String, Value>,
-        selection: &Expanded,
-        typename: Option<&str>,
-    ) -> Result<Value, Bubble> {
-        let typename = typename
-            .or_else(|| object.get("__typename").and_then(Value::as_str))
-            .unwrap_or_default();
-        let mut out = Map::new();
-        if let Some(fields) = selection.get(typename) {
-            for field in fields.values() {
-                let value = match &field.ty {
-                    None => Value::String(typename.to_string()),
-                    Some(ty) => self.value(object.get(&field.key), field, ty)?,
-                };
-                out.insert(field.key.clone(), value);
-            }
-        }
-        Ok(Value::Object(out))
+    fn string(&mut self, value: &str) {
+        serde_json::to_writer(&mut self.out, value).unwrap();
     }
 
-    fn null(&mut self, field: &EField, ty: &Type, reason: Option<String>) -> Result<Value, Bubble> {
+    fn object(&mut self, object: Id, selection: &Expanded, known: Option<&str>) -> Result<(), Bubble> {
+        let doc = self.doc;
+        let typename = known.or_else(|| typename(doc, object)).unwrap_or_default();
+        self.out.push(b'{');
+        if let Some(fields) = selection.get(typename) {
+            for (index, field) in fields.values().enumerate() {
+                if index > 0 {
+                    self.out.push(b',');
+                }
+                self.string(&field.key);
+                self.out.push(b':');
+                match &field.ty {
+                    None => self.string(typename),
+                    Some(ty) => self.value(doc.get(object, &field.key), field, ty)?,
+                }
+            }
+        }
+        self.out.push(b'}');
+        Ok(())
+    }
+
+    /// Replaces what was written since `start` with a null.
+    fn null(&mut self, start: usize, field: &EField, ty: &Type, reason: Option<String>) -> Result<(), Bubble> {
+        self.out.truncate(start);
         if let Some(reason) = reason {
             self.errors.push(json!({ "message": reason }));
         }
         if ty.nullable {
-            return Ok(Value::Null);
+            self.out.extend_from_slice(b"null");
+            return Ok(());
         }
         self.errors.push(json!({
             "message": format!("Cannot return null for non-nullable field {}", field.name)
@@ -427,55 +435,63 @@ impl Shaper<'_> {
         Err(Bubble)
     }
 
-    fn value(&mut self, value: Option<&Value>, field: &EField, ty: &Type) -> Result<Value, Bubble> {
-        let value = match value {
-            None | Some(Value::Null) => return self.null(field, ty, None),
-            Some(value) => value,
+    fn value(&mut self, value: Option<Id>, field: &EField, ty: &Type) -> Result<(), Bubble> {
+        let doc = self.doc;
+        let start = self.out.len();
+        let Some(value) = value.filter(|v| doc.kind(*v) != doc::Kind::Null) else {
+            return self.null(start, field, ty, None);
         };
-        match (&ty.base, value) {
-            (BaseType::List(inner), Value::Array(items)) => {
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    match self.value(Some(item), field, inner) {
-                        Ok(item) => out.push(item),
-                        Err(Bubble) => return self.null(field, ty, None),
+        match (&ty.base, doc.kind(value)) {
+            (BaseType::List(inner), doc::Kind::Arr) => {
+                self.out.push(b'[');
+                for (index, item) in doc.children(value).enumerate() {
+                    if index > 0 {
+                        self.out.push(b',');
+                    }
+                    if self.value(Some(item), field, inner).is_err() {
+                        return self.null(start, field, ty, None);
                     }
                 }
-                Ok(Value::Array(out))
+                self.out.push(b']');
+                Ok(())
             }
-            (BaseType::List(_), _) => self.null(field, ty, Some(format!("Expected a list for {}", field.name))),
-            (BaseType::Named(_), Value::Object(object)) => {
+            (BaseType::List(_), _) => {
+                self.null(start, field, ty, Some(format!("Expected a list for {}", field.name)))
+            }
+            (BaseType::Named(_), doc::Kind::Obj) => {
                 let Some(sub) = &field.sub else {
-                    return Ok(value.clone());
+                    doc.write(value, &mut self.out);
+                    return Ok(());
                 };
                 // The client can only be given types its schema has.
-                if let Some(typename) = object.get("__typename").and_then(Value::as_str) {
+                if let Some(typename) = typename(doc, value) {
                     let visible = typename == field.ret
                         || self.schema.types.get(typename).is_some_and(|t| {
                             !t.inaccessible && self.schema.subtype(typename, &field.ret)
                         });
                     if !visible {
                         let reason = format!("{} cannot be a {}", field.ret, typename);
-                        return self.null(field, ty, Some(reason));
+                        return self.null(start, field, ty, Some(reason));
                     }
                 }
-                match self.object(object, sub, None) {
-                    Ok(value) => Ok(value),
-                    Err(Bubble) => self.null(field, ty, None),
+                match self.object(value, sub, None) {
+                    Ok(()) => Ok(()),
+                    Err(Bubble) => self.null(start, field, ty, None),
                 }
             }
             (BaseType::Named(_), _) if field.sub.is_some() => {
-                self.null(field, ty, Some(format!("Expected an object for {}", field.name)))
+                self.null(start, field, ty, Some(format!("Expected an object for {}", field.name)))
             }
             (BaseType::Named(_), _) => {
                 if let Some(info) = self.schema.types.get(&field.ret).filter(|t| t.kind == Kind::Enum) {
-                    let known = value.as_str().is_some_and(|v| info.values.get(v) == Some(&false));
+                    let known = doc.str(value).is_some_and(|v| info.values.get(v) == Some(&false));
                     if !known {
-                        let reason = format!("{} is not a value of enum {}", value, field.ret);
-                        return self.null(field, ty, Some(reason));
+                        let reason = format!("{} is not a value of enum {}", doc.to_string(value), field.ret);
+                        return self.null(start, field, ty, Some(reason));
                     }
                 }
-                Ok(value.clone())
+                doc.write(value, &mut self.out);
+                Ok(())
             }
         }
     }
@@ -568,17 +584,53 @@ fn read_request<'a>(request: &'a Value, empty: &'a Map<String, Value>) -> Result
     })
 }
 
-async fn graphql(State(gateway): State<Arc<Gateway>>, Json(request): Json<Value>) -> Json<Value> {
+fn json_response(body: Bytes) -> Response {
+    ([(CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+async fn graphql(State(gateway): State<Arc<Gateway>>, Json(request): Json<Value>) -> Response {
     let empty = Map::new();
     let request = match read_request(&request, &empty) {
         Ok(request) => request,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let plan = match plan_for(&gateway, request.query, request.operation_name, request.variables) {
         Ok(plan) => plan,
-        Err(message) => return Json(json!({ "errors": [{ "message": message }] })),
+        Err(message) => return Json(json!({ "errors": [{ "message": message }] })).into_response(),
     };
-    Json(execute(&gateway, &plan, request.variables).await)
+    // Identical queries that arrive while one is being executed share its
+    // response. No request headers reach the subgraphs, so the operation and
+    // its variables are all a response depends on. Mutations always run.
+    let flights = gateway.flights.as_ref().filter(|_| plan.root == "Query");
+    let Some(flights) = flights else {
+        return json_response(execute(&gateway, &plan, request.variables).await.into());
+    };
+    let mut id = request.query.to_string();
+    id.push('\0');
+    id.push_str(request.operation_name.unwrap_or_default());
+    id.push('\0');
+    id.push_str(&serde_json::to_string(request.variables).unwrap());
+
+    let flight = flights
+        .lock()
+        .unwrap()
+        .entry(id.clone())
+        .or_insert_with(|| {
+            let gateway = gateway.clone();
+            let variables = request.variables.clone();
+            async move {
+                let response = execute(&gateway, &plan, &variables).await;
+                // Whoever asks from here on gets a fresh execution.
+                if let Some(flights) = &gateway.flights {
+                    flights.lock().unwrap().remove(&id);
+                }
+                Bytes::from(response)
+            }
+            .boxed()
+            .shared()
+        })
+        .clone();
+    json_response(flight.await)
 }
 
 /// `POST /plan` with a GraphQL request body: plans the operation without
@@ -610,6 +662,10 @@ async fn main() {
         debug: std::env::var("PLAN_DEBUG").is_ok(),
         routes: RouteCache::default(),
         plans: RwLock::new(HashMap::new()),
+        flights: match std::env::var("DEDUPE").as_deref() {
+            Ok("off") => None,
+            _ => Some(Mutex::new(HashMap::new())),
+        },
     });
 
     let app = Router::new()

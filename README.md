@@ -10,7 +10,7 @@ Three passes, described in more detail in the module comment of [`src/plan.rs`](
 
 1. **Greedy assignment.** Each field goes to a subgraph: stay in the subgraph that produced the parent object if it can resolve the field, otherwise hop to the subgraph that can have it ready soonest. Hops to the same subgraph at the same response path are one fetch.
 2. **Leveling.** Each fetch gets the earliest and the latest step it can run at without making the plan deeper.
-3. **Merging.** Fetches to the same subgraph are moved within that window onto the same step, and each (subgraph, step) group is sent as one HTTP request with one aliased `_entities` field per fetch.
+3. **Merging.** Fetches to the same subgraph are moved within that window onto the same step, and each (subgraph, step) group is sent as one HTTP request with one aliased `_entities` field per fetch. Fetches for the same place in the response share one field when they look the entities up the same way.
 
 ## Running
 
@@ -24,6 +24,7 @@ SUPERGRAPH_PATH=./supergraph.graphql ./target/release/prototype-router
 | `SUPERGRAPH_PATH` | `./supergraph.graphql` | Supergraph SDL. Subgraph URLs are taken from it. |
 | `PORT` | `4000` | |
 | `MERGE_MODE` | slack | `asap` never delays a fetch to share a request; the default may, within its slack. |
+| `DEDUPE` | on | Identical queries that arrive while one is executing share its response. `off` executes every request. Mutations always execute. |
 | `PLAN_DEBUG` | unset | Print each new plan to stderr. `PLAN_DEBUG=query` also prints the subgraph queries. |
 
 Endpoints:

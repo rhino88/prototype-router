@@ -11,7 +11,8 @@
 //!      without lengthening the plan.
 //!   3. Merging. Nodes for the same subgraph are moved within that window so
 //!      they land on the same step, and every (subgraph, step) group is sent as
-//!      a single request with one aliased `_entities` field per node.
+//!      a single request with one aliased `_entities` field per node, or
+//!      per set of nodes for the same path that can share one (`can_share`).
 //!
 //! Where pass 1 has more than one way to get a field:
 //!   - A root field that several subgraphs resolve goes to the one that can
@@ -745,6 +746,23 @@ fn merge_reps(target: &mut Vec<RepField>, source: &[RepField]) {
             }
         }
     }
+}
+
+/// Whether two representations have a field of the same name that is read
+/// from different places in the response.
+fn reps_conflict(a: &[RepField], b: &[RepField]) -> bool {
+    a.iter().any(|x| {
+        b.iter().filter(|y| y.name == x.name).any(|y| {
+            x.key != y.key
+                || match (&x.sub, &y.sub) {
+                    (Some(x), Some(y)) => x
+                        .iter()
+                        .any(|(object, fields)| y.get(object).is_some_and(|other| reps_conflict(fields, other))),
+                    (None, None) => false,
+                    _ => true,
+                }
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1852,6 +1870,9 @@ impl<'a> Planner<'a> {
         let mut has_root = false;
         let mut mutation = false;
 
+        // Entity fetches for the same place are one `_entities` field when
+        // they look the entities up the same way.
+        let mut parts: Vec<(PathId, Vec<NodeId>, IndexMap<String, RepSpec>)> = Vec::new();
         for id in nodes {
             let node = &self.nodes[*id];
             let Some(path) = node.path else {
@@ -1862,11 +1883,28 @@ impl<'a> Planner<'a> {
                 }
                 continue;
             };
+            let shared = parts
+                .iter_mut()
+                .find(|(place, members, reps)| *place == path && self.can_share(members, reps, *id));
+            match shared {
+                Some((_, members, reps)) => {
+                    for (object, spec) in &node.reps {
+                        merge_reps(&mut reps[object].fields, &spec.fields);
+                    }
+                    members.push(*id);
+                }
+                None => parts.push((path, vec![*id], node.reps.clone())),
+            }
+        }
+
+        for (path, members, reps) in parts {
             let index = entities.len();
             variables.push(format!("$_r{}:[_Any!]!", index));
             body.push_str(&format!("e{}:_entities(representations:$_r{}){{", index, index));
             let before = body.len();
-            self.print_fragments(node.sel, &mut body);
+            for member in members {
+                self.print_fragments(self.nodes[member].sel, &mut body);
+            }
             if body.len() == before {
                 body.push_str("__typename");
             }
@@ -1883,11 +1921,7 @@ impl<'a> Planner<'a> {
             entities.push(EntityPart {
                 alias: format!("e{}", index),
                 path: elements,
-                reps: node
-                    .reps
-                    .iter()
-                    .map(|(object, spec)| (object.clone(), spec.clone()))
-                    .collect(),
+                reps: reps.into_iter().collect(),
             });
         }
 
@@ -1924,6 +1958,43 @@ impl<'a> Planner<'a> {
             vars,
             aliased: self.aliased && query_has_alias,
         }
+    }
+
+    /// Whether the entity fetch `node` can be the same `_entities` field as
+    /// `members`, whose representations are `reps`: the same types, looked up
+    /// by the same key fields, no field of the representation with two
+    /// values (`@requires` of one field with different arguments), and no
+    /// response key that means two things.
+    /// What one of them `@requires` is then sent to the others as well.
+    fn can_share(&self, members: &[NodeId], reps: &IndexMap<String, RepSpec>, node: NodeId) -> bool {
+        let node = &self.nodes[node];
+        let keys = |spec: &RepSpec| -> BTreeSet<String> {
+            spec.fields.iter().filter(|f| f.required).map(|f| f.key.clone()).collect()
+        };
+        let same_lookup = node.reps.len() == reps.len()
+            && node.reps.iter().all(|(object, spec)| {
+                reps.get(object).is_some_and(|other| {
+                    other.typename == spec.typename
+                        && keys(other) == keys(spec)
+                        && !reps_conflict(&other.fields, &spec.fields)
+                })
+            });
+        if !same_lookup {
+            return false;
+        }
+        let fields = |sel: SelId| self.sels[sel].by_type.values().flatten();
+        members.iter().all(|member| {
+            fields(self.nodes[*member].sel).all(|theirs| {
+                fields(node.sel).all(|ours| {
+                    ours.alias.as_ref().unwrap_or(&ours.key) != theirs.alias.as_ref().unwrap_or(&theirs.key)
+                        || (ours.name == theirs.name
+                            && ours.args == theirs.args
+                            && ours.shape == theirs.shape
+                            && ours.sub.is_none()
+                            && theirs.sub.is_none())
+                })
+            })
+        })
     }
 
     fn print_fields(&self, fields: &[SField], out: &mut String) {
