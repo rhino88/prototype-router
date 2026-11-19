@@ -35,9 +35,9 @@ Endpoints:
 
 ## Results
 
-The prototype rows were run on 2026-11-19 at commit `236ce71`; the other gateways' rows are from 2026-11-18. `prototype-router` is the default merge mode; `prototype-router (asap)` is `MERGE_MODE=asap`; `prototype-router (no dedupe)` is `DEDUPE=off`.
+The prototype rows were run on 2026-11-19 at commit `236ce71`; the other gateways' rows are from 2026-11-18. `prototype-router` is the default merge mode; `prototype-router (asap)` is `MERGE_MODE=asap`; The tables headed "dedupe off" were run for every gateway in one session on 2026-11-19.
 
-In short: it passes the whole compatibility audit, plans about as fast as Grafbase and faster than everything else, and sends the fewest subgraph requests of any gateway tested. Its throughput is the highest measured when identical concurrent queries share an execution, which is what the throughput benchmark sends; with that turned off it is about a quarter of Hive Router's and Cosmo's.
+In short: it passes the whole compatibility audit, plans about as fast as Grafbase and faster than everything else, and sends the fewest subgraph requests of any gateway tested. Its throughput is the highest measured when identical concurrent queries share an execution, which is what the throughput benchmark sends; with dedupe turned off on every gateway it is second, about 10% behind Hive Router at constant load and level with it under stress.
 
 ### Federation compatibility
 
@@ -82,7 +82,6 @@ The prototype rows were run locally. The other rows are the results committed in
 | grafbase | 5,942 | 8.2 | 7.3 | 14.4 | 57.4 | 480 | 52 |
 | hive-gateway-router-runtime | 5,054 | 9.7 | 9.1 | 12.6 | 35.4 | n/a | n/a |
 | hive-gateway | 4,270 | 11.5 | 10.6 | 14.4 | 71.3 | n/a | n/a |
-| **prototype-router (no dedupe)** | 3,713 | 13.3 | 12.4 | 20.4 | 60.8 | 206 | 176 |
 | apollo-router-v3-incremental | 1,595 | 31.0 | 28.8 | 48.3 | 143.1 | 743 | 200 |
 | apollo-router-v3 | 1,272 | 38.7 | 37.7 | 54.7 | 86.9 | 790 | 245 |
 | apollo-router | 1,250 | 39.5 | 38.4 | 56.1 | 97.2 | 793 | 226 |
@@ -103,13 +102,60 @@ Ramp from 50 to 500 VUs and back over 60 s. Every gateway had a 100% success rat
 | grafbase | 7,172 | 31.3 | 28.9 | 67.1 | 98.8 | 496 | 203 |
 | hive-gateway-router-runtime | 5,803 | 37.9 | 37.6 | 67.1 | 98.9 | n/a | n/a |
 | hive-gateway | 5,351 | 40.1 | 40.0 | 69.3 | 116.6 | n/a | n/a |
-| **prototype-router (no dedupe)** | 3,493 | 64.9 | 54.4 | 162.4 | 284.3 | 223 | 304 |
 | apollo-router-v3-incremental | 1,610 | 136.6 | 127.8 | 302.6 | 429.2 | 751 | 646 |
 | apollo-router | 1,349 | 162.3 | 154.0 | 339.6 | 647.9 | 785 | 1,029 |
 | apollo-router-v3 | 1,276 | 171.0 | 162.5 | 364.5 | 523.4 | 798 | 1,053 |
 | apollo-gateway | 723 | 294.8 | 286.9 | 643.2 | 840.6 | n/a | n/a |
 
-Dedupe matters this much because every virtual user sends the same query: identical queries that arrive while one is executing share its response, so most requests cost no subgraph calls. Hive Router is configured the same way in this benchmark (`traffic_shaping.router.dedupe`), and the Apollo Router configurations dedupe identical subgraph requests (`deduplicate_query`). The `no dedupe` rows are what the prototype does when every request is executed.
+Dedupe decides these tables because every virtual user sends the same query: identical queries that arrive while one is executing share its response, so most requests cost no subgraph calls. The benchmark turns it on for every gateway that has it: Hive Router, Hive Gateway and Cosmo dedupe whole client requests, as the prototype does, and Apollo Router, Grafbase and Cosmo dedupe identical subgraph requests.
+
+#### Throughput, dedupe off
+
+The same two runs with dedupe switched off on every gateway, so each request is planned from cache, fetched and assembled in full. All of these were run in one session on 2026-11-19.
+
+| Gateway | Setting changed |
+| --- | --- |
+| prototype-router | `DEDUPE=off` |
+| hive-router | `traffic_shaping.router.dedupe.enabled: false` and `traffic_shaping.all.dedupe_enabled: false` |
+| cosmo | `ENGINE_ENABLE_SINGLE_FLIGHT=false`, `ENGINE_ENABLE_INBOUND_REQUEST_DEDUPLICATION=false`, and `traffic_shaping.all.max_idle_conns_per_host: 100` (see below) |
+| grafbase | `traffic_shaping.inflight_deduplication = false` |
+| hive-gateway, hive-gateway-router-runtime | `inboundInflightRequestDeduplication: false` |
+| apollo-router (all three) | `traffic_shaping.all.deduplicate_query: false` |
+| apollo-gateway | none: it has no dedupe, so its rows are the 2026-11-18 ones from the tables above |
+
+Constant load, 100% success rate for every gateway:
+
+| Gateway | RPS | Avg (ms) | p50 (ms) | p95 (ms) | p99.9 (ms) | CPU max (%) | Mem max (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| hive-router | 4,038 | 12.2 | 10.7 | 22.1 | 132.6 | 279 | 141 |
+| **prototype-router** | 3,671 | 13.4 | 12.6 | 20.6 | 61.9 | 205 | 188 |
+| cosmo | 2,704 | 18.3 | 17.2 | 29.4 | 60.9 | 420 | 232 |
+| grafbase | 2,496 | 19.8 | 18.4 | 31.0 | 76.8 | 306 | 75 |
+| apollo-router-v3-incremental | 1,393 | 35.5 | 34.6 | 49.7 | 79.1 | 595 | 230 |
+| apollo-router | 1,268 | 39.0 | 38.1 | 53.9 | 80.8 | 603 | 279 |
+| apollo-router-v3 | 1,124 | 44.0 | 43.1 | 60.1 | 87.3 | 626 | 290 |
+| apollo-gateway | 733 | 67.4 | 64.5 | 119.4 | 208.9 | n/a | n/a |
+| hive-gateway-router-runtime | 676 | 73.5 | 73.0 | 81.7 | 119.1 | n/a | n/a |
+| hive-gateway | 288 | 171.8 | 157.5 | 291.7 | 434.9 | n/a | n/a |
+
+Stress, 100% success rate for every gateway except `hive-gateway`:
+
+| Gateway | RPS | Avg (ms) | p50 (ms) | p95 (ms) | p99.9 (ms) | CPU max (%) | Mem max (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| hive-router | 3,688 | 61.6 | 59.8 | 130.0 | 181.0 | 290 | 264 |
+| **prototype-router** | 3,643 | 62.3 | 51.4 | 156.9 | 270.7 | 228 | 307 |
+| cosmo | 2,618 | 86.0 | 85.4 | 172.1 | 231.8 | 428 | 822 |
+| grafbase | 2,278 | 99.4 | 87.9 | 230.4 | 330.0 | 319 | 299 |
+| apollo-router-v3-incremental | 1,193 | 185.9 | 168.2 | 424.6 | 602.3 | 611 | 784 |
+| apollo-router | 1,099 | 201.0 | 183.7 | 461.4 | 624.4 | 609 | 1,086 |
+| apollo-router-v3 | 955 | 229.9 | 210.1 | 523.4 | 719.7 | 637 | 1,092 |
+| apollo-gateway | 723 | 294.8 | 286.9 | 643.2 | 840.6 | n/a | n/a |
+| hive-gateway-router-runtime | 651 | 340.0 | 331.2 | 663.5 | 3,736.5 | n/a | n/a |
+| hive-gateway | failed | | | | | n/a | n/a |
+
+- `hive-gateway` stopped accepting connections about 45 s into the stress run, at around 400 VUs, in both of two attempts (4% and 10% of requests succeeded). Until then it served about 265 RPS.
+- Cosmo needed a larger idle connection pool to be measurable here. With its default of 20 idle connections per subgraph it opened new connections fast enough to use up all 16,384 of macOS's ephemeral ports within ten seconds, and requests then failed in k6 (511 RPS, 96% success). The rows above are with the pool raised to 100, which is Cosmo's own per-host connection limit.
+- Cosmo and Grafbase were run a second time for these rows; Grafbase's first run agreed with the one shown (2,388 and 2,250 RPS).
 
 Before the executor was rewritten (commit `aff2581`, no dedupe) the prototype measured 1,739 RPS at constant load and 1,513 RPS under stress, where its memory reached 1.2 GB.
 
@@ -201,7 +247,7 @@ make test-prototype-router                   # default merge mode
 MERGE_MODE=asap make test-prototype-router
 ```
 
-Benchmark: add a `gateways/prototype` directory to the benchmark repository whose `run.sh` starts the release binary with `SUPERGRAPH_PATH` (default `../apollo-router/supergraph.graphql`), start the subgraphs with `make run-subgraphs`, then run `make test gateway=prototype mode=<constant|stress|planning|planning-large>`. Prefix it with `DEDUPE=off` for the `no dedupe` rows.
+Benchmark: add a `gateways/prototype` directory to the benchmark repository whose `run.sh` starts the release binary with `SUPERGRAPH_PATH` (default `../apollo-router/supergraph.graphql`), start the subgraphs with `make run-subgraphs`, then run `make test gateway=prototype mode=<constant|stress|planning|planning-large>`. For the dedupe-off tables, prefix it with `DEDUPE=off` and change the other gateways' settings as listed there.
 
 ## Limitations
 
