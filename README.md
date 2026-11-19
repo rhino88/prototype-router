@@ -35,9 +35,9 @@ Endpoints:
 
 ## Results
 
-Run on 2026-11-18 at commit `aff2581`. `prototype-router` is the default merge mode; `prototype-router (asap)` is `MERGE_MODE=asap`.
+The prototype rows were run on 2026-11-19 at commit `236ce71`; the other gateways' rows are from 2026-11-18. `prototype-router` is the default merge mode; `prototype-router (asap)` is `MERGE_MODE=asap`; `prototype-router (no dedupe)` is `DEDUPE=off`.
 
-In short: it passes the whole compatibility audit, plans faster than everything except Grafbase, and sends the fewest subgraph requests of any gateway tested. Its throughput is poor: about a ninth of Hive Router's and Cosmo's.
+In short: it passes the whole compatibility audit, plans about as fast as Grafbase and faster than everything else, and sends the fewest subgraph requests of any gateway tested. Its throughput is the highest measured when identical concurrent queries share an execution, which is what the throughput benchmark sends; with that turned off it is about a quarter of Hive Router's and Cosmo's.
 
 ### Federation compatibility
 
@@ -62,7 +62,7 @@ The prototype rows were run locally. The other rows are the results committed in
 
 ### Benchmarks
 
-[GraphQL Gateways Benchmark](https://github.com/graphql-hive/graphql-gateways-benchmark), on the branch of [PR #1041](https://github.com/graphql-hive/graphql-gateways-benchmark/pull/1041), which adds the query planning benchmark and the 80 subgraph supergraph. Every gateway was run locally, one after another in one session.
+[GraphQL Gateways Benchmark](https://github.com/graphql-hive/graphql-gateways-benchmark), on the branch of [PR #1041](https://github.com/graphql-hive/graphql-gateways-benchmark/pull/1041), which adds the query planning benchmark and the 80 subgraph supergraph. Every gateway was run locally, one after another in one session on 2026-11-18. The prototype rows were run again on the same machine the next day, after the executor was rewritten, so they are not from the same session as the rows they are compared with.
 
 - Machine: MacBook Pro, Apple M1 Max (10 cores), 64 GB, macOS 27.2, k6 v2.4.0.
 - No CPU pinning (macOS has no `taskset`), so k6, the subgraphs and the gateway share all cores. Read the numbers as a ranking on this machine, not as the published CI figures.
@@ -75,13 +75,14 @@ The prototype rows were run locally. The other rows are the results committed in
 
 | Gateway | RPS | Avg (ms) | p50 (ms) | p95 (ms) | p99.9 (ms) | CPU max (%) | Mem max (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| **prototype-router (asap)** | 19,978 | 2.3 | 2.2 | 4.1 | 9.2 | 134 | 75 |
+| **prototype-router** | 19,741 | 2.4 | 2.2 | 4.1 | 10.6 | 127 | 67 |
 | hive-router | 15,365 | 3.1 | 2.6 | 6.3 | 30.2 | 159 | 112 |
 | cosmo | 15,363 | 3.1 | 2.9 | 5.4 | 11.9 | 233 | 86 |
 | grafbase | 5,942 | 8.2 | 7.3 | 14.4 | 57.4 | 480 | 52 |
 | hive-gateway-router-runtime | 5,054 | 9.7 | 9.1 | 12.6 | 35.4 | n/a | n/a |
 | hive-gateway | 4,270 | 11.5 | 10.6 | 14.4 | 71.3 | n/a | n/a |
-| **prototype-router** | 1,739 | 28.5 | 25.3 | 50.3 | 131.3 | 489 | 83 |
-| **prototype-router (asap)** | 1,598 | 31.0 | 27.2 | 56.6 | 164.2 | 461 | 95 |
+| **prototype-router (no dedupe)** | 3,713 | 13.3 | 12.4 | 20.4 | 60.8 | 206 | 176 |
 | apollo-router-v3-incremental | 1,595 | 31.0 | 28.8 | 48.3 | 143.1 | 743 | 200 |
 | apollo-router-v3 | 1,272 | 38.7 | 37.7 | 54.7 | 86.9 | 790 | 245 |
 | apollo-router | 1,250 | 39.5 | 38.4 | 56.1 | 97.2 | 793 | 226 |
@@ -95,19 +96,22 @@ Ramp from 50 to 500 VUs and back over 60 s. Every gateway had a 100% success rat
 
 | Gateway | RPS | Avg (ms) | p50 (ms) | p95 (ms) | p99.9 (ms) | CPU max (%) | Mem max (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| **prototype-router** | 21,471 | 7.2 | 5.4 | 19.1 | 48.5 | 136 | 82 |
+| **prototype-router (asap)** | 21,343 | 7.2 | 5.4 | 18.8 | 50.7 | 139 | 79 |
 | hive-router | 17,653 | 10.3 | 8.4 | 25.7 | 64.2 | 168 | 156 |
 | cosmo | 16,383 | 9.8 | 7.5 | 24.7 | 60.4 | 275 | 124 |
 | grafbase | 7,172 | 31.3 | 28.9 | 67.1 | 98.8 | 496 | 203 |
 | hive-gateway-router-runtime | 5,803 | 37.9 | 37.6 | 67.1 | 98.9 | n/a | n/a |
 | hive-gateway | 5,351 | 40.1 | 40.0 | 69.3 | 116.6 | n/a | n/a |
+| **prototype-router (no dedupe)** | 3,493 | 64.9 | 54.4 | 162.4 | 284.3 | 223 | 304 |
 | apollo-router-v3-incremental | 1,610 | 136.6 | 127.8 | 302.6 | 429.2 | 751 | 646 |
-| **prototype-router** | 1,513 | 140.9 | 120.5 | 343.3 | 562.6 | 506 | 1,167 |
-| **prototype-router (asap)** | 1,458 | 145.9 | 123.7 | 365.7 | 596.9 | 498 | 926 |
 | apollo-router | 1,349 | 162.3 | 154.0 | 339.6 | 647.9 | 785 | 1,029 |
 | apollo-router-v3 | 1,276 | 171.0 | 162.5 | 364.5 | 523.4 | 798 | 1,053 |
 | apollo-gateway | 723 | 294.8 | 286.9 | 643.2 | 840.6 | n/a | n/a |
 
-The prototype's memory reached 1.2 GB under stress, the highest measured.
+Dedupe matters this much because every virtual user sends the same query: identical queries that arrive while one is executing share its response, so most requests cost no subgraph calls. Hive Router is configured the same way in this benchmark (`traffic_shaping.router.dedupe`), and the Apollo Router configurations dedupe identical subgraph requests (`deduplicate_query`). The `no dedupe` rows are what the prototype does when every request is executed.
+
+Before the executor was rewritten (commit `aff2581`, no dedupe) the prototype measured 1,739 RPS at constant load and 1,513 RPS under stress, where its memory reached 1.2 GB.
 
 #### Query planning, 4 subgraphs
 
@@ -118,8 +122,8 @@ Planning overhead p50 in ms:
 | Gateway | simple | federated | complex |
 | --- | --- | --- | --- |
 | grafbase | 0.03 | 0.10 | 0.19 |
-| **prototype-router (asap)** | 0.04 | 0.28 | 0.40 |
-| **prototype-router** | 0.05 | 0.27 | 0.57 |
+| **prototype-router (asap)** | 0.03 | 0.12 | 0.27 |
+| **prototype-router** | 0.03 | 0.14 | 0.30 |
 | hive-router | 0.10 | 0.71 | 1.37 |
 | cosmo | 0.18 | 1.66 | 4.32 |
 | apollo-router-v3-incremental | 0.39 | 1.82 | 3.17 |
@@ -151,9 +155,9 @@ Planning overhead p50 in ms:
 
 | Gateway | product_page | search | checkout | order_history |
 | --- | --- | --- | --- | --- |
+| **prototype-router (asap)** | 6.1 | 3.0 | 1.1 | 1.9 |
 | grafbase | 8.1 | 2.5 | 0.9 | 1.7 |
-| **prototype-router (asap)** | 13.7 | 4.2 | 1.6 | 2.6 |
-| **prototype-router** | 23.7 | 5.6 | 1.8 | 3.5 |
+| **prototype-router** | 12.0 | 4.0 | 1.3 | 2.5 |
 | hive-gateway ¹ | 94 | 44 | 23 | 40 |
 | apollo-router-v3-incremental | 112 | 46 | 17 | 45 |
 | hive-router | 288 | 72 | 17 | 30 |
@@ -181,10 +185,11 @@ Plan quality, as sequential steps / subgraph requests:
 
 Notes on reading these:
 
-- With slack merging the prototype sends 19% to 23% fewer requests than Hive Router on `product_page`, `checkout` and `order_history` at the same depth, and plans 8 to 12 times faster.
+- With slack merging the prototype sends 19% to 23% fewer requests than Hive Router on `product_page`, `checkout` and `order_history` at the same depth, and plans 12 to 24 times faster.
 - On `search` the default mode measured 7 steps where `asap` and most other gateways measured 6. Merging is meant not to deepen the plan, so this needs a look. Steps are inferred from request timing, not read from the plan.
 - Planning overhead covers everything a gateway does for a new operation. The prototype does less there than the others (see [Limitations](#limitations): no variable validation, no authorization directives), which flatters its numbers.
 - Subgraph requests count HTTP requests. The prototype puts several entity fetches in one request under aliases; the other gateways send one fetch per request.
+- The planning numbers of the prototype roughly halved between the two runs without a change to the planner: the build now uses mimalloc and link-time optimization. The plans themselves are the same.
 
 ### Reproducing
 
@@ -196,7 +201,7 @@ make test-prototype-router                   # default merge mode
 MERGE_MODE=asap make test-prototype-router
 ```
 
-Benchmark: add a `gateways/prototype` directory to the benchmark repository whose `run.sh` starts the release binary with `SUPERGRAPH_PATH` (default `../apollo-router/supergraph.graphql`), start the subgraphs with `make run-subgraphs`, then run `make test gateway=prototype mode=<constant|stress|planning|planning-large>`.
+Benchmark: add a `gateways/prototype` directory to the benchmark repository whose `run.sh` starts the release binary with `SUPERGRAPH_PATH` (default `../apollo-router/supergraph.graphql`), start the subgraphs with `make run-subgraphs`, then run `make test gateway=prototype mode=<constant|stress|planning|planning-large>`. Prefix it with `DEDUPE=off` for the `no dedupe` rows.
 
 ## Limitations
 
