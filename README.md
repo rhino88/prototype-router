@@ -10,7 +10,9 @@ Three passes, described in more detail in the module comment of [`src/plan.rs`](
 
 1. **Greedy assignment.** Each field goes to a subgraph: stay in the subgraph that produced the parent object if it can resolve the field, otherwise hop to the subgraph that can have it ready soonest. Hops to the same subgraph at the same response path are one fetch.
 2. **Leveling.** Each fetch gets the earliest and the latest step it can run at without making the plan deeper.
-3. **Merging.** Fetches to the same subgraph are moved within that window onto the same step, and each (subgraph, step) group is sent as one HTTP request with one aliased `_entities` field per fetch. Fetches for the same place in the response share one field when they look the entities up the same way.
+3. **Merging.** Fetches to the same subgraph are moved within that window onto the same step, and each (subgraph, step) group is sent as one HTTP request with one aliased `_entities` field per fetch. Fetches for the same place in the response share one field when they look the entities up the same way, and so do places that ask the same of the same kind of entity, so an entity that is in several of them is fetched once.
+
+Subgraph queries carry no more than the executor needs. Where a field's type is an object type, its values are not asked for `__typename` and get no type condition, and a key or `@requires` field the client selected itself is not selected a second time under a hidden alias.
 
 ## Running
 
@@ -24,6 +26,7 @@ SUPERGRAPH_PATH=./supergraph.graphql ./target/release/prototype-router
 | `SUPERGRAPH_PATH` | `./supergraph.graphql` | Supergraph SDL. Subgraph URLs are taken from it. |
 | `PORT` | `4000` | |
 | `MERGE_MODE` | slack | `asap` never delays a fetch to share a request; the default may, within its slack. |
+| `MAX_CONNECTIONS` | 100 | Requests in flight per subgraph. More than that wait and are sent in the order they came. `0` for no limit. |
 | `DEDUPE` | on | Identical queries that arrive while one is executing share its response. `off` executes every request. Mutations always execute. |
 | `PLAN_DEBUG` | unset | Print each new plan to stderr. `PLAN_DEBUG=query` also prints the subgraph queries. |
 
@@ -37,7 +40,7 @@ Endpoints:
 
 The prototype rows were run on 2026-11-19 at commit `236ce71`; the other gateways' rows are from 2026-11-18. `prototype-router` is the default merge mode; `prototype-router (asap)` is `MERGE_MODE=asap`; The tables headed "dedupe off" were run for every gateway in one session on 2026-11-19.
 
-In short: it passes the whole compatibility audit, plans about as fast as Grafbase and faster than everything else, and sends the fewest subgraph requests of any gateway tested. Its throughput is the highest measured when identical concurrent queries share an execution, which is what the throughput benchmark sends; with dedupe turned off on every gateway it is second, about 10% behind Hive Router at constant load and level with it under stress.
+In short: it passes the whole compatibility audit, plans about as fast as Grafbase and faster than everything else, and sends the fewest subgraph requests of any gateway tested. Its throughput is the highest measured when identical concurrent queries share an execution, which is what the throughput benchmark sends; with dedupe turned off on every gateway it is also the highest, about 40% ahead of Hive Router at constant load and under stress.
 
 ### Federation compatibility
 
@@ -111,7 +114,7 @@ Dedupe decides these tables because every virtual user sends the same query: ide
 
 #### Throughput, dedupe off
 
-The same two runs with dedupe switched off on every gateway, so each request is planned from cache, fetched and assembled in full. All of these were run in one session on 2026-11-19.
+The same two runs with dedupe switched off on every gateway, so each request is planned from cache, fetched and assembled in full. All of these were run in one session on 2026-11-19. The `prototype-router` and `hive-router` rows were run again later that day, one after the other, after the changes described under the tables; the machine was somewhat slower by then (Hive Router measured 4,038 and 3,688 RPS in the morning), so compare those two rows with each other rather than with the rest.
 
 | Gateway | Setting changed |
 | --- | --- |
@@ -127,8 +130,8 @@ Constant load, 100% success rate for every gateway:
 
 | Gateway | RPS | Avg (ms) | p50 (ms) | p95 (ms) | p99.9 (ms) | CPU max (%) | Mem max (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| hive-router | 4,038 | 12.2 | 10.7 | 22.1 | 132.6 | 279 | 141 |
-| **prototype-router** | 3,671 | 13.4 | 12.6 | 20.6 | 61.9 | 205 | 188 |
+| **prototype-router** | 5,188 | 9.4 | 8.6 | 15.2 | 62.2 | 164 | 77 |
+| hive-router | 3,680 | 13.4 | 10.9 | 28.4 | 138.0 | 274 | 153 |
 | cosmo | 2,704 | 18.3 | 17.2 | 29.4 | 60.9 | 420 | 232 |
 | grafbase | 2,496 | 19.8 | 18.4 | 31.0 | 76.8 | 306 | 75 |
 | apollo-router-v3-incremental | 1,393 | 35.5 | 34.6 | 49.7 | 79.1 | 595 | 230 |
@@ -142,8 +145,8 @@ Stress, 100% success rate for every gateway except `hive-gateway`:
 
 | Gateway | RPS | Avg (ms) | p50 (ms) | p95 (ms) | p99.9 (ms) | CPU max (%) | Mem max (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| hive-router | 3,688 | 61.6 | 59.8 | 130.0 | 181.0 | 290 | 264 |
-| **prototype-router** | 3,643 | 62.3 | 51.4 | 156.9 | 270.7 | 228 | 307 |
+| **prototype-router** | 4,829 | 47.1 | 41.6 | 110.4 | 187.1 | 175 | 145 |
+| hive-router | 3,467 | 65.5 | 63.8 | 137.7 | 199.8 | 290 | 287 |
 | cosmo | 2,618 | 86.0 | 85.4 | 172.1 | 231.8 | 428 | 822 |
 | grafbase | 2,278 | 99.4 | 87.9 | 230.4 | 330.0 | 319 | 299 |
 | apollo-router-v3-incremental | 1,193 | 185.9 | 168.2 | 424.6 | 602.3 | 611 | 784 |
@@ -157,7 +160,13 @@ Stress, 100% success rate for every gateway except `hive-gateway`:
 - Cosmo needed a larger idle connection pool to be measurable here. With its default of 20 idle connections per subgraph it opened new connections fast enough to use up all 16,384 of macOS's ephemeral ports within ten seconds, and requests then failed in k6 (511 RPS, 96% success). The rows above are with the pool raised to 100, which is Cosmo's own per-host connection limit.
 - Cosmo and Grafbase were run a second time for these rows; Grafbase's first run agreed with the one shown (2,388 and 2,250 RPS).
 
-Before the executor was rewritten (commit `aff2581`, no dedupe) the prototype measured 1,739 RPS at constant load and 1,513 RPS under stress, where its memory reached 1.2 GB.
+Before the executor was rewritten (commit `aff2581`, no dedupe) the prototype measured 1,739 RPS at constant load and 1,513 RPS under stress, where its memory reached 1.2 GB. At commit `a90aae6` it measured 3,671 and 3,643 RPS. What changed after that:
+
+- The subgraphs use about three times the CPU the gateway does in this benchmark, so most of the gain is in what they are asked: no `__typename` and no type condition where the type is known, no key field selected twice, and one `_entities` field for every place that asks the same of the same entities. The one large request of this query became about a quarter cheaper for its subgraph, and throughput rose by about 30% with the response byte for byte the same.
+- Subgraph requests go through a small HTTP/1.1 client instead of `reqwest`, whose connection pool lock was where the gateway's threads waited. With the smaller responses to parse, gateway CPU per request roughly halved.
+- At most 100 requests are in flight per subgraph (`MAX_CONNECTIONS`), the same default as Hive Router and Cosmo. It does not change throughput; under stress it brought p99.9 from about 230 ms to about 185 ms over two runs each.
+
+Run again that day on the build of `a90aae6`, under stress and in the same slower conditions as the two rows above, it measured 3,504 and 3,544 RPS.
 
 #### Query planning, 4 subgraphs
 
@@ -257,4 +266,5 @@ Benchmark: add a `gateways/prototype` directory to the benchmark repository whos
 - Variable values are not validated against the schema; only literals are.
 - Subgraph errors are passed on with the message and the subgraph name, without paths.
 - The planner's maps use a fast, non-collision-resistant hash, and the plan cache is unbounded. Do not expose it to untrusted clients.
-- No header forwarding, timeouts, retries, TLS configuration or telemetry.
+- No header forwarding, timeouts, TLS configuration or telemetry. A subgraph request is only sent again when it got no answer at all, and a mutation never is.
+- Subgraphs at `http://` URLs are called by a small HTTP/1.1 client of its own ([`src/http.rs`](src/http.rs)); other URLs go through `reqwest`.

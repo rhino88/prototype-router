@@ -494,6 +494,10 @@ impl Schema {
         }
     }
 
+    pub fn is_object(&self, ty: &str) -> bool {
+        self.types.get(ty).is_some_and(|t| t.kind == Kind::Object)
+    }
+
     pub fn is_composite(&self, ty: &str) -> bool {
         self.types
             .get(ty)

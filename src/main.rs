@@ -3,6 +3,7 @@
 //! fetches so each subgraph is called at most once per step. See `plan.rs`.
 
 mod doc;
+mod http;
 mod plan;
 mod schema;
 
@@ -18,12 +19,13 @@ use axum::{
 };
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use plan::{EField, EntityPart, Expanded, Group, Merge, Plan, RepField, RouteCache};
+use plan::{EField, EntityPart, Expanded, Group, Merge, PathStep, Plan, RepField, RouteCache};
 use schema::{Kind, Schema};
 use serde_json::{json, Map, Value};
+use tokio::sync::Semaphore;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{atomic::Ordering::Relaxed, Arc, Mutex, RwLock},
 };
 
 #[global_allocator]
@@ -31,7 +33,13 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 struct Gateway {
     schema: Schema,
+    /// Per subgraph, for the URLs `http::Endpoint` takes.
+    endpoints: Vec<Option<http::Endpoint>>,
+    /// For the others.
     client: reqwest::Client,
+    /// Per subgraph, how many more requests may be sent to it right now.
+    /// The ones that have to wait are sent in the order they came.
+    limits: Vec<Semaphore>,
     merge: Merge,
     debug: bool,
     routes: RouteCache,
@@ -57,7 +65,7 @@ fn typename(doc: &Doc, object: Id) -> Option<&str> {
 
 /// Finds every object at `path` in the response. Only the fields on the path
 /// are followed.
-fn locate(schema: &Schema, doc: &Doc, node: Id, path: &[(String, String)], out: &mut Vec<Id>) {
+fn locate(schema: &Schema, doc: &Doc, node: Id, path: &[PathStep], out: &mut Vec<Id>) {
     match doc.kind(node) {
         doc::Kind::Arr => {
             for item in doc.children(node) {
@@ -65,14 +73,14 @@ fn locate(schema: &Schema, doc: &Doc, node: Id, path: &[(String, String)], out: 
             }
         }
         doc::Kind::Obj => {
-            let Some(((parent_type, key), rest)) = path.split_first() else {
+            let Some((step, rest)) = path.split_first() else {
                 out.push(node);
                 return;
             };
-            if typename(doc, node).is_some_and(|t| !matches(schema, t, parent_type)) {
+            if step.check && typename(doc, node).is_some_and(|t| !matches(schema, t, &step.parent)) {
                 return;
             }
-            if let Some(child) = doc.get(node, key) {
+            if let Some(child) = doc.get(node, &step.key) {
                 locate(schema, doc, child, rest, out);
             }
         }
@@ -94,24 +102,33 @@ fn prepare(schema: &Schema, group: &Group, doc: &Doc, client: &Map<String, Value
     let mut targets = Vec::new();
     let mut any = group.has_root;
     // Parts for the same place share the search for it.
-    let mut located: Vec<(&[(String, String)], Vec<Id>)> = Vec::new();
+    let mut located: Vec<(&[PathStep], Vec<Id>)> = Vec::new();
+    let mut several = Vec::new();
 
     for (index, part) in group.entities.iter().enumerate() {
         if index > 0 {
             body.push(b',');
         }
         body.extend_from_slice(format!("\"_r{}\":[", index).as_bytes());
-        let found = match located.iter().position(|(path, _)| *path == part.path.as_slice()) {
-            Some(found) => found,
-            None => {
-                let mut objects = Vec::new();
-                locate(schema, doc, ROOT, &part.path, &mut objects);
-                located.push((&part.path, objects));
-                located.len() - 1
+        several.clear();
+        let mut single = 0;
+        for path in &part.paths {
+            single = match located.iter().position(|(other, _)| *other == path.as_slice()) {
+                Some(found) => found,
+                None => {
+                    let mut objects = Vec::new();
+                    locate(schema, doc, ROOT, path, &mut objects);
+                    located.push((path, objects));
+                    located.len() - 1
+                }
+            };
+            if part.paths.len() > 1 {
+                several.extend_from_slice(&located[single].1);
             }
-        };
+        }
+        let entities = if part.paths.len() == 1 { &located[single].1 } else { &several };
         let before = body.len();
-        targets.push(representations(schema, part, doc, &located[found].1, &mut body));
+        targets.push(representations(schema, part, doc, entities, &mut body));
         any |= body.len() > before;
         body.push(b']');
     }
@@ -208,17 +225,20 @@ fn representations(
     let mut seen: schema::HashMap<Vec<u8>, usize> = Default::default();
     let mut representation = Vec::new();
     let mut targets = Vec::with_capacity(entities.len());
+    // Where the type is known from the schema the objects don't carry it.
+    let only = part.reps.values().next().filter(|_| part.concrete);
     for &entity in entities {
-        let Some(typename) = typename(doc, entity) else {
-            continue;
-        };
-        // Planned for this type, or for the interface object it started as.
-        let Some(spec) = part.reps.get(typename).or_else(|| {
-            part.reps
-                .iter()
-                .find(|(planned, _)| schema.subtype(typename, planned))
-                .map(|(_, spec)| spec)
-        }) else {
+        let spec = only.or_else(|| {
+            // Planned for this type, or for the interface object it started as.
+            let typename = typename(doc, entity)?;
+            part.reps.get(typename).or_else(|| {
+                part.reps
+                    .iter()
+                    .find(|(planned, _)| schema.subtype(typename, planned))
+                    .map(|(_, spec)| spec)
+            })
+        });
+        let Some(spec) = spec else {
             continue;
         };
         representation.clear();
@@ -249,17 +269,28 @@ fn representations(
 
 async fn send(gateway: &Gateway, group: &Group, body: Vec<u8>) -> Result<Bytes, String> {
     let subgraph = &gateway.schema.subgraphs[group.subgraph];
-    gateway
-        .client
-        .post(&subgraph.url)
-        .header(CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| format!("{}: {}", subgraph.name, e))?
-        .bytes()
-        .await
-        .map_err(|e| format!("{}: {}", subgraph.name, e))
+    let _permit = gateway.limits[group.subgraph].acquire().await;
+    let response = match &gateway.endpoints[group.subgraph] {
+        Some(endpoint) => {
+            // Room for the headers and for a response a little larger.
+            let size = group.response_size.load(Relaxed) + 1024;
+            endpoint.post(&body, size, !group.mutation).await
+        }
+        None => {
+            let request = gateway.client.post(&subgraph.url).header(CONTENT_TYPE, "application/json").body(body);
+            match request.send().await {
+                Ok(response) => response.bytes().await.map_err(|e| e.to_string()),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+    };
+    match response {
+        Ok(response) => {
+            group.response_size.store(response.len(), Relaxed);
+            Ok(response)
+        }
+        Err(message) => Err(format!("{}: {}", subgraph.name, message)),
+    }
 }
 
 /// Runs the plan: a request is sent as soon as the responses it depends on
@@ -268,18 +299,12 @@ async fn send(gateway: &Gateway, group: &Group, body: Vec<u8>) -> Result<Bytes, 
 /// Returns the response as JSON text.
 async fn execute(gateway: &Gateway, plan: &Plan, variables: &Map<String, Value>) -> Vec<u8> {
     let schema = &gateway.schema;
-    let mut doc = Doc::new();
+    let mut doc = Doc::new(plan.nodes.load(Relaxed) + 64);
     let mut errors: Vec<Value> = Vec::new();
     let concrete = |name: &str| schema.types.get(name).is_some_and(|t| t.kind == Kind::Object);
 
     let count = plan.groups.len();
     let mut waiting: Vec<usize> = plan.groups.iter().map(|g| g.deps.len()).collect();
-    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); count];
-    for (index, group) in plan.groups.iter().enumerate() {
-        for dep in &group.deps {
-            dependents[*dep].push(index);
-        }
-    }
     let mut ready: Vec<usize> = (0..count).filter(|i| waiting[*i] == 0).collect();
     let mut running = FuturesUnordered::new();
 
@@ -293,7 +318,7 @@ async fn execute(gateway: &Gateway, plan: &Plan, variables: &Map<String, Value>)
                 }),
                 // Nothing to ask for: whatever waits on this can go ahead.
                 None => {
-                    for dependent in &dependents[index] {
+                    for dependent in &group.dependents {
                         waiting[*dependent] -= 1;
                         if waiting[*dependent] == 0 {
                             ready.push(*dependent);
@@ -357,7 +382,7 @@ async fn execute(gateway: &Gateway, plan: &Plan, variables: &Map<String, Value>)
                 }
             }
         }
-        for dependent in &dependents[index] {
+        for dependent in &group.dependents {
             waiting[*dependent] -= 1;
             if waiting[*dependent] == 0 {
                 ready.push(*dependent);
@@ -365,7 +390,9 @@ async fn execute(gateway: &Gateway, plan: &Plan, variables: &Map<String, Value>)
         }
     }
 
-    let mut shaper = Shaper { schema, doc: &doc, errors, out: b"{\"data\":".to_vec() };
+    let mut out = Vec::with_capacity(plan.response_size.load(Relaxed) + 256);
+    out.extend_from_slice(b"{\"data\":");
+    let mut shaper = Shaper { schema, doc: &doc, errors, out };
     let start = shaper.out.len();
     if shaper.object(ROOT, &plan.expanded, Some(plan.root)).is_err() {
         shaper.out.truncate(start);
@@ -376,6 +403,8 @@ async fn execute(gateway: &Gateway, plan: &Plan, variables: &Map<String, Value>)
         serde_json::to_writer(&mut shaper.out, &shaper.errors).unwrap();
     }
     shaper.out.push(b'}');
+    plan.nodes.store(doc.size(), Relaxed);
+    plan.response_size.store(shaper.out.len(), Relaxed);
     shaper.out
 }
 
@@ -403,15 +432,15 @@ impl Shaper<'_> {
         let typename = known.or_else(|| typename(doc, object)).unwrap_or_default();
         self.out.push(b'{');
         if let Some(fields) = selection.get(typename) {
+            let mut cursor = doc.start(object);
             for (index, field) in fields.values().enumerate() {
                 if index > 0 {
                     self.out.push(b',');
                 }
-                self.string(&field.key);
-                self.out.push(b':');
+                self.out.extend_from_slice(&field.written);
                 match &field.ty {
                     None => self.string(typename),
-                    Some(ty) => self.value(doc.get(object, &field.key), field, ty)?,
+                    Some(ty) => self.value(doc.get_next(object, &mut cursor, &field.key), field, ty)?,
                 }
             }
         }
@@ -463,6 +492,12 @@ impl Shaper<'_> {
                     doc.write(value, &mut self.out);
                     return Ok(());
                 };
+                if field.concrete {
+                    return match self.object(value, sub, Some(&field.ret)) {
+                        Ok(()) => Ok(()),
+                        Err(Bubble) => self.null(start, field, ty, None),
+                    };
+                }
                 // The client can only be given types its schema has.
                 if let Some(typename) = typename(doc, value) {
                     let visible = typename == field.ret
@@ -505,19 +540,19 @@ fn plan_for(
 ) -> Result<Arc<Plan>, String> {
     // `@skip` and `@include` are applied before planning, so the plan
     // depends on the boolean variables as well as on the operation.
-    let mut id = query.to_string();
+    let mut id = std::borrow::Cow::Borrowed(query);
     if let Some(name) = operation_name {
-        id.push('\0');
-        id.push_str(name);
+        id.to_mut().push('\0');
+        id.to_mut().push_str(name);
     }
     for (name, value) in variables {
         if let Value::Bool(value) = value {
-            id.push('\0');
-            id.push_str(name);
-            id.push(if *value { '1' } else { '0' });
+            id.to_mut().push('\0');
+            id.to_mut().push_str(name);
+            id.to_mut().push(if *value { '1' } else { '0' });
         }
     }
-    if let Some(plan) = gateway.plans.read().unwrap().get(&id) {
+    if let Some(plan) = gateway.plans.read().unwrap().get(id.as_ref()) {
         return Ok(plan.clone());
     }
     let plan = Arc::new(plan::plan(
@@ -535,10 +570,14 @@ fn plan_for(
                 .entities
                 .iter()
                 .map(|e| {
-                    let path: Vec<&str> = e.path.iter().map(|(_, k)| k.as_str()).collect();
+                    let paths: Vec<String> = e
+                        .paths
+                        .iter()
+                        .map(|path| path.iter().map(|step| step.key.as_str()).collect::<Vec<_>>().join("."))
+                        .collect();
                     let mut types: Vec<&str> = e.reps.keys().map(String::as_str).collect();
                     types.sort();
-                    format!("{}<{}>", path.join("."), types.join("|"))
+                    format!("{}<{}>", paths.join(","), types.join("|"))
                 })
                 .collect();
             eprintln!(
@@ -553,7 +592,7 @@ fn plan_for(
             }
         }
     }
-    gateway.plans.write().unwrap().insert(id, plan.clone());
+    gateway.plans.write().unwrap().insert(id.into_owned(), plan.clone());
     Ok(plan)
 }
 
@@ -651,8 +690,17 @@ async fn plan_only(State(gateway): State<Arc<Gateway>>, Json(request): Json<Valu
 async fn main() {
     let path = std::env::var("SUPERGRAPH_PATH").unwrap_or("./supergraph.graphql".into());
     let sdl = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("Unable to read {}", path));
+    let schema = Schema::parse(&sdl);
+    let limit = match std::env::var("MAX_CONNECTIONS").map(|limit| limit.parse()) {
+        Ok(Ok(0)) => Semaphore::MAX_PERMITS,
+        Ok(Ok(limit)) => limit,
+        Ok(Err(_)) => panic!("MAX_CONNECTIONS is not a number"),
+        Err(_) => 100,
+    };
     let gateway = Arc::new(Gateway {
-        schema: Schema::parse(&sdl),
+        limits: schema.subgraphs.iter().map(|_| Semaphore::new(limit.min(Semaphore::MAX_PERMITS))).collect(),
+        endpoints: schema.subgraphs.iter().map(|subgraph| http::Endpoint::new(&subgraph.url)).collect(),
+        schema,
         client: reqwest::Client::new(),
         // MERGE_MODE=asap never delays a fetch; the default also uses slack.
         merge: match std::env::var("MERGE_MODE").as_deref() {

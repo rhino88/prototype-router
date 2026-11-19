@@ -13,6 +13,14 @@
 //!      they land on the same step, and every (subgraph, step) group is sent as
 //!      a single request with one aliased `_entities` field per node, or
 //!      per set of nodes for the same path that can share one (`can_share`).
+//!      Paths whose fields come out the same, selection and representations,
+//!      share one too, so an entity that is at several of them is asked for
+//!      once.
+//!
+//! Subgraph queries carry no more than the executor needs: where a field's
+//! type is an object type its values are not asked for `__typename` and need
+//! no type condition, and a key or `@requires` field the client selected under
+//! its own name is read from there instead of being selected again.
 //!
 //! Where pass 1 has more than one way to get a field:
 //!   - A root field that several subgraphs resolve goes to the one that can
@@ -40,7 +48,7 @@ use serde_json::{Map, Value};
 use std::{
     collections::BTreeSet,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicUsize, Arc, Mutex},
 };
 
 /// The operation with fragments inlined, `@skip` and `@include` applied, and
@@ -53,6 +61,8 @@ pub type Expanded = IndexMap<String, IndexMap<String, EField>>;
 #[derive(Clone)]
 pub struct EField {
     pub key: String,
+    /// The key as it is written in the response: quoted, with the colon.
+    pub written: Vec<u8>,
     pub name: String,
     /// Printed arguments, `(first: 5)`, or empty.
     pub args: String,
@@ -62,12 +72,21 @@ pub struct EField {
     /// `None` for `__typename`.
     pub ty: Option<Type>,
     pub ret: String,
+    /// `ret` is an object type, so that is what every value is and
+    /// subgraphs are not asked for `__typename`.
+    pub concrete: bool,
     pub sub: Option<Arc<Expanded>>,
 }
 
 /// Prefix of the response keys used for fields the plan needs but the client
 /// did not ask for (keys and `@requires` inputs).
 pub const HIDDEN: &str = "_k_";
+
+fn written_key(key: &str) -> Vec<u8> {
+    let mut written = serde_json::to_vec(key).unwrap_or_default();
+    written.push(b':');
+    written
+}
 
 fn hidden_key(name: &str, args: &str) -> String {
     if args.is_empty() {
@@ -81,7 +100,7 @@ fn hidden_key(name: &str, args: &str) -> String {
 }
 
 /// One field of an entity representation, read from the response.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct RepField {
     /// Name in the representation.
     pub name: String,
@@ -94,17 +113,32 @@ pub struct RepField {
     pub sub: Option<HashMap<String, Vec<RepField>>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct RepSpec {
     /// `__typename` to send.
     pub typename: String,
     pub fields: Vec<RepField>,
 }
 
+/// One field on the way to a place in the response.
+#[derive(PartialEq)]
+pub struct PathStep {
+    /// Type of the objects the field is read from.
+    pub parent: String,
+    pub key: String,
+    /// The objects can be of other types too, so their type has to be looked
+    /// at.
+    pub check: bool,
+}
+
 pub struct EntityPart {
     pub alias: String,
-    /// Where the entities are in the response: (parent type, response key).
-    pub path: Vec<(String, String)>,
+    /// Where the entities are in the response. Several places share one
+    /// `_entities` field when they ask the same of the same kind of entity.
+    pub paths: Vec<Vec<PathStep>>,
+    /// The entities are all of the one type `reps` has, and are not asked
+    /// for `__typename`.
+    pub concrete: bool,
     /// What to send in the representation, per type of the object found.
     pub reps: HashMap<String, RepSpec>,
 }
@@ -123,6 +157,11 @@ pub struct Group {
     pub vars: Vec<String>,
     /// The query has aliases made by `alias_for`.
     pub aliased: bool,
+    pub mutation: bool,
+    /// Requests that wait for this one.
+    pub dependents: Vec<usize>,
+    /// Size of the last response, to read the next into a buffer that fits.
+    pub response_size: AtomicUsize,
 }
 
 pub struct Plan {
@@ -135,6 +174,10 @@ pub struct Plan {
     pub fetch_nodes: usize,
     /// No way of merging these fetch nodes needs fewer requests than this.
     pub request_bound: usize,
+    /// Number of nodes the last execution's responses were parsed into and
+    /// the size of what it returned: what the next one makes room for.
+    pub nodes: AtomicUsize,
+    pub response_size: AtomicUsize,
 }
 
 const UNREACHABLE: usize = usize::MAX / 4;
@@ -245,6 +288,8 @@ struct SField {
     /// Shape of the field's type in the subgraph: wrappers, and the name for
     /// leaf types.
     shape: String,
+    /// The object type every value of the field has, if there is only one.
+    exact: Option<String>,
     sub: Option<SelId>,
 }
 
@@ -335,6 +380,8 @@ struct Planner<'a> {
     hidden: HashMap<usize, HashMap<String, Hidden>>,
     /// Some field had to be given an alias, see `alias_for`.
     aliased: bool,
+    /// Paths where every object has the same, known type.
+    concrete_paths: HashSet<PathId>,
 }
 
 /// How far the merge pass may go.
@@ -379,6 +426,7 @@ pub fn plan(
         resolvers: HashMap::default(),
         hidden: HashMap::default(),
         aliased: false,
+        concrete_paths: HashSet::default(),
     };
 
     if let Some(fields) = expanded.get(root) {
@@ -434,6 +482,8 @@ pub fn plan(
         steps,
         fetch_nodes,
         request_bound,
+        nodes: AtomicUsize::new(0),
+        response_size: AtomicUsize::new(0),
     })
 }
 
@@ -607,11 +657,13 @@ impl Normalizer<'_> {
                                 .entry(key.to_string())
                                 .or_insert_with(|| EField {
                                     key: key.to_string(),
+                                    written: written_key(key),
                                     name: name.to_string(),
                                     args: String::new(),
                                     via: via.to_string(),
                                     ty: None,
                                     ret: String::new(),
+                                    concrete: false,
                                     sub: None,
                                 });
                         }
@@ -659,11 +711,13 @@ impl Normalizer<'_> {
                             };
                             EField {
                                 key: key.to_string(),
+                                written: written_key(key),
                                 name: name.to_string(),
                                 args,
                                 via: via.to_string(),
                                 ty: Some(info.ty.clone()),
                                 ret: info.ret.clone(),
+                                concrete: schema.is_object(&info.ret),
                                 sub: composite.then(|| Arc::new(Expanded::default())),
                             }
                         });
@@ -1015,12 +1069,14 @@ impl<'a> Planner<'a> {
                 sub: rep_sub,
             });
             fields.push(EField {
+                written: written_key(&key),
                 key,
                 name: item.name.clone(),
                 args: item.args.clone(),
                 via: object.to_string(),
                 ty: Some(info.ty.clone()),
                 ret: info.ret.clone(),
+                concrete: schema.is_object(&info.ret),
                 sub,
             });
         }
@@ -1082,7 +1138,9 @@ impl<'a> Planner<'a> {
             _ => object,
         };
         let mut deps = BTreeSet::from([pos.node]);
-        let mut needed: [Option<Hidden>; 2] = [None, None];
+        let mut needed: [Vec<RepField>; 2] = [Vec::new(), Vec::new()];
+        // What the client selected here.
+        let selected = pos.parent.as_ref().map(|p| p.sub.clone());
         for (index, (fs, required)) in [(&key.fs, true), (requires, false)].into_iter().enumerate() {
             if fs.is_empty() {
                 continue;
@@ -1091,7 +1149,28 @@ impl<'a> Planner<'a> {
             if hidden.0.len() < fs.iter().filter(|f| schema.applies(&f.conds, source)).count() {
                 return Err(format!("{} does not have the fields of {:?}", source, fs));
             }
-            for field in &hidden.0 {
+            let mut reps = hidden.1.clone();
+            for (field, rep) in hidden.0.iter().zip(reps.iter_mut()) {
+                // A scalar the client asked for under its own name is read
+                // from there instead of being selected a second time.
+                let own = selected
+                    .as_ref()
+                    .and_then(|s| s.get(source))
+                    .and_then(|fields| fields.get(&field.name))
+                    .filter(|own| {
+                        own.name == field.name
+                            && own.args.is_empty()
+                            && field.args.is_empty()
+                            && own.sub.is_none()
+                            && field.sub.is_none()
+                    });
+                let field = match own {
+                    Some(own) => {
+                        rep.key = own.key.clone();
+                        own
+                    }
+                    None => field,
+                };
                 let provider = self.plan_field(pos, source, field)?;
                 if field.sub.is_none() {
                     deps.insert(provider);
@@ -1099,7 +1178,7 @@ impl<'a> Planner<'a> {
                     self.collect_deps(pos.path, source, field, &mut deps);
                 }
             }
-            needed[index] = Some(hidden);
+            needed[index] = reps;
         }
 
         let node = self.entity_node(graph, pos.path, requires_raw);
@@ -1121,8 +1200,8 @@ impl<'a> Planner<'a> {
             );
         }
         let spec = &mut self.nodes[node].reps[object];
-        for hidden in needed.iter().flatten() {
-            merge_reps(&mut spec.fields, &hidden.1);
+        for reps in &needed {
+            merge_reps(&mut spec.fields, reps);
         }
         Ok(node)
     }
@@ -1368,11 +1447,13 @@ impl<'a> Planner<'a> {
 
         let field = EField {
             key: parent.key.clone(),
+            written: written_key(&parent.key),
             name: parent.name.clone(),
             args: parent.args.clone(),
             via: parent.via.clone(),
             ty: Some(info.ty.clone()),
             ret: info.ret.clone(),
+            concrete: schema.is_object(&info.ret),
             sub: Some(parent.sub.clone()),
         };
         self.add_field(&host, owner, &parent.object, &field, info, Some(join), false)?;
@@ -1416,6 +1497,9 @@ impl<'a> Planner<'a> {
         let graph = self.nodes[pos.node].subgraph;
         let (ret, provided) = self.child_scope(&pos.provided, object, field, info, join);
         let path = self.child_path(pos.path, object, &field.key);
+        if field.concrete {
+            self.concrete_paths.insert(path);
+        }
         let child = Pos {
             node: pos.node,
             sel: child_sel,
@@ -1483,6 +1567,7 @@ impl<'a> Planner<'a> {
             name: field.name.clone(),
             args: field.args.clone(),
             shape,
+            exact: sub.and(self.schema.is_object(&info.ret).then(|| info.ret.clone())),
             sub,
         });
     }
@@ -1649,6 +1734,7 @@ impl<'a> Planner<'a> {
                         name: "__typename".into(),
                         args: String::new(),
                         shape: String::new(),
+                        exact: None,
                         sub: None,
                     });
                 }
@@ -1811,7 +1897,7 @@ impl<'a> Planner<'a> {
                 group_of[*id] = index;
             }
         }
-        let groups = members
+        let mut groups: Vec<Group> = members
             .iter()
             .enumerate()
             .map(|(index, ((step, graph, _), nodes))| {
@@ -1825,6 +1911,11 @@ impl<'a> Planner<'a> {
                 self.group(*graph, *step, deps, nodes, var_defs)
             })
             .collect();
+        for index in 0..groups.len() {
+            for dep in groups[index].deps.clone() {
+                groups[dep].dependents.push(index);
+            }
+        }
         Ok((groups, depth))
     }
 
@@ -1879,6 +1970,9 @@ impl<'a> Planner<'a> {
                 has_root = true;
                 mutation |= node.mutation;
                 if let Some(fields) = self.sels[node.sel].by_type.get(self.root) {
+                    if !body.is_empty() {
+                        body.push(' ');
+                    }
                     self.print_fields(fields, &mut body);
                 }
                 continue;
@@ -1897,30 +1991,53 @@ impl<'a> Planner<'a> {
             }
         }
 
+        // Places that ask the same of the same kind of entity are one field
+        // as well: an entity that is in several of them is fetched once.
+        let mut fields: Vec<(String, Vec<PathId>, IndexMap<String, RepSpec>)> = Vec::new();
         for (path, members, reps) in parts {
+            let sels: Vec<SelId> = members.iter().map(|member| self.nodes[*member].sel).collect();
+            let mut selection = String::new();
+            self.print_fragments(&sels, &mut selection);
+            if selection.is_empty() {
+                selection.push_str("__typename");
+            }
+            match fields.iter_mut().find(|(other, _, theirs)| *other == selection && *theirs == reps) {
+                Some((_, paths, _)) => paths.push(path),
+                None => fields.push((selection, vec![path], reps)),
+            }
+        }
+
+        for (selection, paths, reps) in fields {
             let index = entities.len();
             variables.push(format!("$_r{}:[_Any!]!", index));
-            body.push_str(&format!("e{}:_entities(representations:$_r{}){{", index, index));
-            let before = body.len();
-            for member in members {
-                self.print_fragments(self.nodes[member].sel, &mut body);
+            if !body.is_empty() {
+                body.push(' ');
             }
-            if body.len() == before {
-                body.push_str("__typename");
-            }
-            body.push_str("} ");
+            body.push_str(&format!("e{}:_entities(representations:$_r{}){{{}}}", index, index, selection));
 
-            let mut elements = Vec::new();
-            let mut current = path;
-            while current != 0 {
-                let (parent, object, key) = &self.paths[current];
-                elements.push((object.clone(), key.clone()));
-                current = *parent;
-            }
-            elements.reverse();
+            let concrete = reps.len() == 1 && paths.iter().all(|path| self.concrete_paths.contains(path));
+            let paths = paths
+                .into_iter()
+                .map(|path| {
+                    let mut steps = Vec::new();
+                    let mut current = path;
+                    while current != 0 {
+                        let (parent, object, key) = &self.paths[current];
+                        steps.push(PathStep {
+                            parent: object.clone(),
+                            key: key.clone(),
+                            check: *parent != 0 && !self.concrete_paths.contains(parent),
+                        });
+                        current = *parent;
+                    }
+                    steps.reverse();
+                    steps
+                })
+                .collect();
             entities.push(EntityPart {
                 alias: format!("e{}", index),
-                path: elements,
+                paths,
+                concrete,
                 reps: reps.into_iter().collect(),
             });
         }
@@ -1957,6 +2074,9 @@ impl<'a> Planner<'a> {
             entities,
             vars,
             aliased: self.aliased && query_has_alias,
+            mutation,
+            dependents: Vec::new(),
+            response_size: AtomicUsize::new(0),
         }
     }
 
@@ -1997,8 +2117,12 @@ impl<'a> Planner<'a> {
         })
     }
 
-    fn print_fields(&self, fields: &[SField], out: &mut String) {
+    fn print_fields<'s>(&'s self, fields: impl IntoIterator<Item = &'s SField>, out: &mut String) {
+        let mut first = true;
         for field in fields {
+            if !std::mem::take(&mut first) {
+                out.push(' ');
+            }
             let key = field.alias.as_ref().unwrap_or(&field.key);
             if key != &field.name {
                 out.push_str(key);
@@ -2006,19 +2130,51 @@ impl<'a> Planner<'a> {
             }
             out.push_str(&field.name);
             out.push_str(&field.args);
-            if let Some(sub) = field.sub {
-                out.push_str("{__typename ");
-                self.print_fragments(sub, out);
-                out.push('}');
+            let Some(sub) = field.sub else {
+                continue;
+            };
+            out.push('{');
+            // Values that can only be of one type need no `__typename` and
+            // no type condition.
+            let by_type = &self.sels[sub].by_type;
+            let only = field.exact.as_ref().and_then(|exact| {
+                by_type
+                    .get(exact)
+                    .filter(|fields| by_type.len() == 1 && !fields.is_empty())
+            });
+            match only {
+                Some(fields) => self.print_fields(fields, out),
+                None => {
+                    out.push_str("__typename");
+                    self.print_fragments(&[sub], out);
+                }
             }
-            out.push(' ');
+            out.push('}');
         }
     }
 
-    fn print_fragments(&self, sel: SelId, out: &mut String) {
-        for (object, fields) in &self.sels[sel].by_type {
+    /// The selections as one inline fragment per type condition. A field
+    /// that several of them have is printed once.
+    fn print_fragments(&self, sels: &[SelId], out: &mut String) {
+        let mut by_type: IndexMap<&str, Vec<&SField>> = IndexMap::default();
+        for sel in sels {
+            for (object, fields) in &self.sels[*sel].by_type {
+                let merged = by_type.entry(object.as_str()).or_default();
+                for field in fields {
+                    let key = field.alias.as_ref().unwrap_or(&field.key);
+                    if !merged.iter().any(|other| other.alias.as_ref().unwrap_or(&other.key) == key) {
+                        merged.push(field);
+                    }
+                }
+            }
+        }
+        for (object, fields) in by_type {
             if fields.is_empty() {
                 continue;
+            }
+            // Punctuation separates tokens, so only names need a space.
+            if out.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+                out.push(' ');
             }
             out.push_str("...on ");
             out.push_str(object);

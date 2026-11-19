@@ -12,11 +12,13 @@ path = "src/main.rs"
 async-graphql-parser = "7.0.17"
 async-graphql-value = "7.0.17"
 axum = "0.8.4"
+bytes = "1"
+httparse = "1"
 futures-util = "0.3"
 indexmap = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "http2"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
 mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]

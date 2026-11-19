@@ -51,9 +51,17 @@ pub struct Doc {
 pub const ROOT: Id = 0;
 
 impl Doc {
-    pub fn new() -> Doc {
+    /// With room for `nodes` nodes.
+    pub fn new(nodes: usize) -> Doc {
         let root = Node { kind: Kind::Obj, key_buf: 0, key_start: 0, key_end: 0, buf: 0, a: NONE, b: NONE, next: NONE };
-        Doc { bufs: Vec::new(), nodes: vec![root] }
+        let mut all = Vec::with_capacity(nodes.max(64));
+        all.push(root);
+        Doc { bufs: Vec::with_capacity(8), nodes: all }
+    }
+
+    /// Number of nodes there are.
+    pub fn size(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Parses a JSON document and returns its node. With `unalias`, keys
@@ -124,11 +132,42 @@ impl Doc {
         self.find(object, key.as_bytes())
     }
 
+    /// The first field of an object, for `get_next`.
+    pub fn start(&self, object: Id) -> Cursor {
+        match self.nodes[object as usize].kind {
+            Kind::Obj => Cursor(self.nodes[object as usize].a),
+            _ => Cursor(NONE),
+        }
+    }
+
+    /// `get` for reading fields one after another: the field after the one
+    /// found last is tried first, which is the one wanted whenever the
+    /// fields are read in the order they are in.
+    pub fn get_next(&self, object: Id, cursor: &mut Cursor, key: &str) -> Option<Id> {
+        let found = match cursor.0 {
+            NONE => self.find(object, key.as_bytes())?,
+            next if self.key(next) == key.as_bytes() => next,
+            _ => self.find(object, key.as_bytes())?,
+        };
+        cursor.0 = self.nodes[found as usize].next;
+        Some(found)
+    }
+
     fn find(&self, object: Id, key: &[u8]) -> Option<Id> {
-        if self.kind(object) != Kind::Obj {
+        let object = &self.nodes[object as usize];
+        if object.kind != Kind::Obj {
             return None;
         }
-        self.children(object).find(|field| self.key(*field) == key)
+        let mut id = object.a;
+        while id != NONE {
+            let field = &self.nodes[id as usize];
+            // Most keys are told apart by their length, without reading them.
+            if (field.key_end - field.key_start) as usize == key.len() && self.key(id) == key {
+                return Some(id);
+            }
+            id = field.next;
+        }
+        None
     }
 
     fn append(&mut self, object: Id, field: Id) {
@@ -270,6 +309,9 @@ impl Doc {
     }
 }
 
+/// See `Doc::get_next`.
+pub struct Cursor(Id);
+
 pub struct Children<'a> {
     doc: &'a Doc,
     next: Id,
@@ -326,6 +368,23 @@ impl Parser<'_> {
         self.expect(b'"')?;
         let start = self.at;
         loop {
+            // Eight bytes at a time up to the first quote, backslash or
+            // control character.
+            while let Some(bytes) = self.text.get(self.at..self.at + 8) {
+                const ONES: u64 = 0x0101_0101_0101_0101;
+                const HIGH: u64 = 0x8080_8080_8080_8080;
+                let word = u64::from_le_bytes(bytes.try_into().unwrap());
+                let zero = |word: u64| word.wrapping_sub(ONES) & !word & HIGH;
+                let found = zero(word ^ (ONES * b'"' as u64))
+                    | zero(word ^ (ONES * b'\\' as u64))
+                    | (word.wrapping_sub(ONES * 0x20) & !word & HIGH);
+                if found != 0 {
+                    // The lowest mark is exact; the bytes below it are plain.
+                    self.at += (found.trailing_zeros() / 8) as usize;
+                    break;
+                }
+                self.at += 8;
+            }
             match self.peek().ok_or(())? {
                 b'"' => {
                     self.at += 1;
@@ -490,7 +549,7 @@ mod tests {
     use super::*;
 
     fn parsed(text: &str) -> (Doc, Id) {
-        let mut doc = Doc::new();
+        let mut doc = Doc::new(0);
         let id = doc.parse(Bytes::copy_from_slice(text.as_bytes()), false).unwrap();
         (doc, id)
     }
@@ -516,15 +575,47 @@ mod tests {
     }
 
     #[test]
+    fn reads_long_strings() {
+        // Every special byte at every offset of the eight read at once.
+        for special in ["\\\"", "\\\\", "\\u00e9", "é", "\\n"] {
+            for offset in 0..20 {
+                let text = format!("[\"{}{}tail\",\"{}\"]", "x".repeat(offset), special, "y".repeat(offset));
+                let (doc, id) = parsed(&text);
+                assert_eq!(doc.to_string(id), text);
+            }
+        }
+        for offset in 0..20 {
+            for bad in ["\n", "\u{1f}", "\\x"] {
+                let text = format!("\"{}{}tail\"", "x".repeat(offset), bad);
+                let mut doc = Doc::new(0);
+                assert!(doc.parse(Bytes::from(text.clone()), false).is_err(), "{:?}", text);
+            }
+            let text = format!("\"{}", "x".repeat(offset));
+            assert!(Doc::new(0).parse(Bytes::from(text), false).is_err());
+        }
+    }
+
+    #[test]
+    fn reads_fields_in_turn() {
+        let (doc, id) = parsed(r#"{"a":1,"b":2,"c":3}"#);
+        let mut cursor = doc.start(id);
+        for key in ["a", "b", "c", "a", "c", "x", "b", "c"] {
+            assert_eq!(doc.get_next(id, &mut cursor, key), doc.get(id, key), "{}", key);
+        }
+        let (doc, id) = parsed("[1]");
+        assert_eq!(doc.get_next(id, &mut doc.start(id), "a"), None);
+    }
+
+    #[test]
     fn rejects_invalid_json() {
         for text in [
             "", "{", "[1,]", "{\"a\":1,}", "{a:1}", "01", "1.", "-", "1e", "\"a", "\"\\x\"", "\"\\u12g4\"",
             "\"a\nb\"", "tru", "nul", "{} {}", "[1 2]", "{\"a\" 1}",
         ] {
-            let mut doc = Doc::new();
+            let mut doc = Doc::new(0);
             assert!(doc.parse(Bytes::copy_from_slice(text.as_bytes()), false).is_err(), "{:?}", text);
         }
-        let mut doc = Doc::new();
+        let mut doc = Doc::new(0);
         assert!(doc.parse(Bytes::from_static(b"\"\xff\""), false).is_err());
         let deep = "[".repeat(MAX_DEPTH + 2) + &"]".repeat(MAX_DEPTH + 2);
         assert!(doc.parse(Bytes::from(deep), false).is_err());
@@ -532,7 +623,7 @@ mod tests {
 
     #[test]
     fn reads_aliased_keys() {
-        let mut doc = Doc::new();
+        let mut doc = Doc::new(0);
         let id = doc.parse(Bytes::from_static(br#"{"_a4_Bookid":1,"_k_id":2}"#), true).unwrap();
         assert_eq!(doc.to_string(id), r#"{"id":1,"_k_id":2}"#);
     }
