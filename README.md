@@ -38,6 +38,207 @@ Endpoints:
 
 ## Results
 
+Two sessions are recorded here. The Linux VM section is a full re-run of the audit and the benchmark on 2026-11-19. The MacBook Pro section is the previous session and is left as it was.
+
+### Linux VM, 2026-11-19
+
+`prototype-router` at commit `6dc7500`, release build (`lto = "fat"`, `codegen-units = 1`) with rustc 1.100.0. The image's rustc 1.83 cannot read this `Cargo.lock` (`edition2024`). No router code was changed.
+
+- Machine: 4 vCPU Intel Xeon (family 6, model 207, 1 thread per core), 16 GB RAM (15 GiB reported by `free`), Ubuntu 24.04.5, kernel 6.12.113, KVM. k6 v2.4.0.
+- Audit: [Federation Gateway Audit](https://github.com/graphql-hive/federation-gateway-audit) at `9c874b9`, the same commit as the tables below. Both merge modes.
+- Benchmark: [GraphQL Gateways Benchmark](https://github.com/graphql-hive/graphql-gateways-benchmark) at `6423e4f` on the branch of [PR #1041](https://github.com/graphql-hive/graphql-gateways-benchmark/pull/1041). Same gateway versions as the Mac session. One run each, in one session.
+- CPU placement: the harness pins k6 to core 0 and the gateway to the rest. A probe of that default saturated k6 (two hot threads on one core, about 3,900 RPS) while the prototype used about 30% of one core, so the number was k6's. These runs set `LOAD_CPUSET=0-3` and `GATEWAY_CPUSET=0-3`, which the harness accepts, so k6, the gateway and the subgraphs share all 4 cores. That is the same sharing the Mac session had, where `taskset` does not exist.
+- With dedupe on, k6 still used most of the CPU (about 280% during the prototype's constant run, gateway about 40% of one core). Those rows are partly how fast k6 can issue the same query. The dedupe-off rows are where the gateway and the subgraphs do the work.
+- `prototype-router` is the default merge mode. `prototype-router (asap)` is `MERGE_MODE=asap`.
+
+#### Federation compatibility
+
+Both merge modes passed every case. There were no failing tests. The other gateways were not re-run; their rows in the Mac section are the results committed in the audit repository at `9c874b9`.
+
+| Gateway | Compatibility | Test cases | Test suites | Failing tests |
+| --- | --- | --- | --- | --- |
+| **prototype-router** | 100.00% | 210 / 210 | 48 / 48 | none |
+| **prototype-router (asap)** | 100.00% | 210 / 210 | 48 / 48 | none |
+
+Per suite, both modes, failed = 0:
+
+| Suite | Cases | Suite | Cases |
+| --- | --- | --- | --- |
+| abstract-types | 18 | child-type-mismatch | 4 |
+| circular-reference-interface | 2 | complex-entity-call | 1 |
+| corrupted-supergraph-node-id | 10 | enum-intersection | 5 |
+| fed1-external-extends | 4 | fed1-external-extends-resolvable | 1 |
+| fed1-external-extension | 4 | fed2-external-extends | 4 |
+| fed2-external-extension | 4 | include-skip | 4 |
+| input-object-intersection | 3 | interface-object-indirect-extension | 1 |
+| interface-object-with-requires | 7 | keys-mashup | 1 |
+| mutations | 4 | mysterious-external | 2 |
+| nested-provides | 2 | node | 1 |
+| non-resolvable-interface-object | 7 | null-keys | 1 |
+| override-type-interface | 4 | override-with-requires | 4 |
+| parent-entity-call | 1 | parent-entity-call-complex | 1 |
+| partial-union | 2 | partial-union-complex | 5 |
+| provides-on-interface | 2 | provides-on-union | 2 |
+| requires-circular | 2 | requires-interface | 5 |
+| requires-requires | 5 | requires-with-argument | 5 |
+| requires-with-argument-conflict | 1 | requires-with-fragments | 6 |
+| shared-root | 2 | simple-entity-call | 1 |
+| simple-inaccessible | 4 | simple-interface-object | 13 |
+| simple-override | 2 | simple-requires-provides | 12 |
+| skip-entity-fetch | 7 | typename | 6 |
+| unavailable-override | 2 | union-interface-distributed | 10 |
+| union-intersection | 12 | union-overfetching | 4 |
+
+Against the previous prototype rows (also 210 / 210 and 48 / 48) nothing moved. The audit ranking against the other gateways is unchanged, because those rows were not re-run.
+
+#### Throughput, constant load
+
+50 VUs for 60 s after a 15 s warmup, 4 subgraphs, the same query every time. Error rate is the share of requests that failed the harness checks (HTTP 200, no GraphQL errors). Every gateway was 0%.
+
+| Gateway | RPS | Avg (ms) | p50 | p90 | p95 | p99 | p99.9 | CPU max (%) | Mem max (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **prototype-router (asap)** | 11,613 | 4.2 | 3.6 | 7.3 | 8.9 | 12.4 | 17.7 | 41 | 31 |
+| **prototype-router** | 11,412 | 4.2 | 3.7 | 7.4 | 9.0 | 12.6 | 18.4 | 40 | 30 |
+| hive-router | 9,965 | 4.9 | 4.4 | 8.0 | 9.5 | 12.8 | 17.8 | 65 | 95 |
+| cosmo | 7,822 | 6.2 | 5.8 | 9.5 | 10.8 | 14.0 | 19.1 | 97 | 78 |
+| hive-gateway-router-runtime | 4,357 | 11.3 | 10.8 | 13.6 | 14.9 | 19.0 | 33.6 | 109 | 814 |
+| grafbase | 3,547 | 13.9 | 13.4 | 18.3 | 20.3 | 25.1 | 33.8 | 217 | 64 |
+| hive-gateway | 3,505 | 14.0 | 13.4 | 16.4 | 17.8 | 23.0 | 56.8 | 107 | 886 |
+| apollo-router-v3-incremental | 951 | 51.9 | 51.3 | 65.1 | 69.5 | 78.0 | 89.9 | 315 | 153 |
+| apollo-router | 840 | 58.8 | 58.2 | 73.2 | 77.8 | 86.6 | 100.1 | 323 | 182 |
+| apollo-router-v3 | 702 | 70.2 | 69.5 | 88.2 | 94.0 | 106.4 | 124.3 | 325 | 187 |
+| apollo-gateway | 299 | 164.6 | 160.3 | 199.7 | 210.5 | 236.9 | 287.2 | 274 | 1,358 |
+
+On the Mac the same order was prototype, hive-router, cosmo, then a gap. Absolute RPS is lower here (prototype 11.4k vs 19.7k). The prototype's CPU stayed near 40% of one core, so this is not its ceiling on this machine.
+
+#### Throughput, stress
+
+Ramp from 50 to 500 VUs and back over 60 s. Every gateway had a 0% error rate, including `hive-gateway`, which stopped accepting connections in the Mac stress run.
+
+| Gateway | RPS | Avg (ms) | p50 | p90 | p95 | p99 | p99.9 | CPU max (%) | Mem max (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **prototype-router** | 11,053 | 15.4 | 12.5 | 31.9 | 38.9 | 53.3 | 76.5 | 40 | 47 |
+| **prototype-router (asap)** | 10,972 | 15.6 | 12.7 | 32.5 | 39.7 | 55.3 | 79.4 | 41 | 43 |
+| hive-router | 9,784 | 17.3 | 14.6 | 34.2 | 41.6 | 57.0 | 79.2 | 64 | 120 |
+| cosmo | 8,167 | 22.7 | 19.0 | 45.0 | 53.9 | 75.2 | 105.2 | 96 | 114 |
+| hive-gateway-router-runtime | 4,154 | 51.5 | 49.6 | 91.7 | 103.8 | 124.6 | 149.1 | 103 | 1,117 |
+| hive-gateway | 3,864 | 53.9 | 51.5 | 93.7 | 104.5 | 137.2 | 163.6 | 112 | 1,121 |
+| grafbase | 3,592 | 61.9 | 57.2 | 117.1 | 134.2 | 165.9 | 209.9 | 216 | 255 |
+| apollo-router-v3-incremental | 821 | 261.1 | 231.8 | 532.7 | 606.0 | 733.9 | 918.8 | 302 | 538 |
+| apollo-router | 734 | 291.1 | 266.4 | 587.0 | 674.5 | 816.1 | 967.8 | 309 | 873 |
+| apollo-router-v3 | 612 | 346.0 | 311.3 | 708.4 | 802.8 | 994.1 | 1,194.1 | 309 | 871 |
+| apollo-gateway | 258 | 794.2 | 749.1 | 1,627.1 | 1,792.3 | 2,249.3 | 3,215.5 | 250 | 1,677 |
+
+#### Throughput, dedupe off
+
+The same two runs with dedupe switched off, using the settings listed in the Mac section. Cosmo got `ENGINE_ENABLE_SINGLE_FLIGHT=false` and `ENGINE_ENABLE_INBOUND_REQUEST_DEDUPLICATION=false`. Its idle pool was left at the default of 20; on this kernel that did not exhaust ephemeral ports (100% success). On macOS the same default failed and the pool was raised to 100. Apollo Gateway has no dedupe switch; its rows are a second run in this session, not a copy of the rows above.
+
+Constant load, 0% error rate for every gateway:
+
+| Gateway | RPS | Avg (ms) | p50 | p90 | p95 | p99 | p99.9 | CPU max (%) | Mem max (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **prototype-router** | 2,962 | 16.7 | 16.3 | 22.2 | 24.3 | 29.4 | 38.2 | 60 | 55 |
+| hive-router | 2,057 | 24.0 | 23.5 | 31.5 | 34.3 | 40.8 | 52.1 | 115 | 119 |
+| grafbase | 1,272 | 39.0 | 38.5 | 48.7 | 52.1 | 59.6 | 74.0 | 116 | 77 |
+| cosmo | 1,209 | 41.0 | 40.0 | 55.8 | 61.0 | 72.0 | 90.7 | 195 | 169 |
+| apollo-router | 571 | 86.5 | 85.8 | 106.6 | 113.1 | 126.1 | 146.9 | 277 | 195 |
+| apollo-router-v3 | 524 | 94.2 | 93.5 | 115.4 | 122.1 | 135.7 | 157.0 | 285 | 207 |
+| hive-gateway-router-runtime | 485 | 102.0 | 100.6 | 111.6 | 118.6 | 138.1 | 169.9 | 116 | 966 |
+| apollo-router-v3-incremental | 442 | 112.3 | 74.6 | 92.7 | 98.3 | 111.0 | 29,492.1 | 272 | 171 |
+| apollo-gateway | 338 | 145.9 | 144.1 | 169.3 | 177.3 | 195.2 | 224.2 | 266 | 1,302 |
+| hive-gateway | 225 | 219.3 | 209.3 | 284.9 | 309.0 | 337.6 | 493.1 | 135 | 1,204 |
+
+Stress, 0% error rate for every gateway:
+
+| Gateway | RPS | Avg (ms) | p50 | p90 | p95 | p99 | p99.9 | CPU max (%) | Mem max (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **prototype-router** | 2,841 | 80.1 | 75.6 | 153.0 | 169.2 | 202.1 | 247.3 | 64 | 109 |
+| hive-router | 1,919 | 117.7 | 115.1 | 226.7 | 242.9 | 264.5 | 279.4 | 114 | 233 |
+| cosmo | 1,253 | 178.2 | 170.9 | 340.7 | 362.9 | 393.9 | 420.5 | 187 | 773 |
+| grafbase | 1,145 | 196.0 | 178.6 | 396.1 | 444.9 | 526.5 | 599.5 | 119 | 312 |
+| apollo-router-v3-incremental | 535 | 405.6 | 368.0 | 851.6 | 954.6 | 1,144.7 | 1,438.7 | 261 | 672 |
+| apollo-router | 487 | 443.1 | 393.8 | 923.8 | 1,052.7 | 1,275.4 | 1,500.7 | 266 | 922 |
+| hive-gateway-router-runtime | 450 | 469.3 | 471.8 | 810.5 | 851.3 | 969.1 | 7,053.4 | 114 | 1,524 |
+| apollo-router-v3 | 421 | 508.8 | 456.8 | 1,100.0 | 1,219.9 | 1,426.7 | 1,654.1 | 273 | 890 |
+| apollo-gateway | 294 | 711.2 | 677.2 | 1,402.6 | 1,567.0 | 1,895.5 | 2,437.4 | 250 | 1,618 |
+| hive-gateway | 207 | 820.5 | 772.5 | 1,304.2 | 1,387.9 | 2,845.9 | 21,690.6 | 134 | 1,547 |
+
+`apollo-router-v3-incremental` at constant load and `hive-gateway` under stress kept a 0% error rate, but p99.9 is a single stall (29 s and 22 s) rather than the body of the distribution. p99 for those two rows is 111 ms and 2.8 s.
+
+With dedupe off the prototype did 2,962 RPS at constant load against hive-router's 2,057, about 44% more. On the Mac that gap was about 41% (5,188 vs 3,680). The order under stress is the same as on the Mac: prototype, hive-router, cosmo, grafbase.
+
+#### Query planning, 4 subgraphs
+
+One VU, 1000 iterations, warm and cold. Overhead is cold minus warm. Every gateway had a 0% error rate. Plan shape is sequential steps / subgraph requests (`simple` is 1 / 1 for everyone).
+
+Planning overhead, p50 / p90 / p95 / p99 in ms:
+
+| Gateway | simple | federated | complex |
+| --- | --- | --- | --- |
+| grafbase | 0.05 / 0.16 / 0.19 / 0.27 | 0.15 / 0.49 / 0.61 / 0.80 | 0.28 / 0.77 / 0.93 / 1.12 |
+| **prototype-router (asap)** | 0.03 / 0.09 / 0.11 / 0.25 | 0.20 / 0.41 / 0.55 / 1.24 | 0.37 / 0.62 / 0.75 / 1.32 |
+| **prototype-router** | 0.03 / 0.10 / 0.12 / 0.28 | 0.21 / 0.41 / 0.52 / 1.23 | 0.40 / 0.65 / 0.74 / 1.06 |
+| hive-router | 0.15 / 0.27 / 0.32 / 0.64 | 0.87 / 1.16 / 1.27 / 1.49 | 1.45 / 1.82 / 1.93 / 2.28 |
+| cosmo | 0.28 / 0.38 / 0.42 / 0.62 | 1.92 / 2.29 / 2.59 / 10.74 | 4.41 / 5.01 / 7.43 / 18.12 |
+| hive-gateway-router-runtime | 0.56 / 1.08 / 1.62 / 2.36 | 2.03 / 3.24 / 3.54 / 4.46 | 3.13 / 4.61 / 4.87 / 5.69 |
+| apollo-router | 0.51 / 0.72 / 0.81 / 1.07 | 2.69 / 3.36 / 3.54 / 4.07 | 4.78 / 5.49 / 5.82 / 6.67 |
+| apollo-gateway | 0.55 / 1.30 / 1.61 / 2.13 | 2.73 / 4.09 / 4.68 / 6.48 | 4.48 / 6.07 / 6.92 / 10.87 |
+| apollo-router-v3 | 0.57 / 0.77 / 0.85 / 1.02 | 2.78 / 3.43 / 3.71 / 4.28 | 4.85 / 5.61 / 5.94 / 6.59 |
+| apollo-router-v3-incremental | 0.57 / 0.79 / 0.89 / 1.12 | 2.92 / 3.60 / 3.78 / 4.37 | 4.87 / 5.73 / 6.08 / 6.78 |
+| hive-gateway | 0.98 / 1.48 / 2.72 / 3.79 | 9.66 / 11.74 / 12.40 / 16.85 | 14.32 / 17.63 / 19.21 / 28.90 |
+
+Plan quality:
+
+| Gateway | federated | complex |
+| --- | --- | --- |
+| **prototype-router** | 4 / 6 | 4 / 6 |
+| hive-router | 4 / 7 | 4 / 8 |
+| hive-gateway-router-runtime | 4 / 7 | 4 / 8 |
+| cosmo | 4 / 7 | 4 / 8 |
+| **prototype-router (asap)** | 4 / 8 | 4 / 8 |
+| hive-gateway | 3 / 7 | 4 / 11 |
+| grafbase | 4 / 13 | 4 / 29 |
+| apollo-router-v3-incremental | 4 / 13 | 4 / 30 |
+| apollo-router, apollo-router-v3, apollo-gateway | 4 / 16 | 4 / 33 |
+
+The prototype's plans match the Mac session exactly, including `search` on the large graph below (7 steps in the default mode, 6 with `asap`). Grafbase still has the lowest overhead on `federated` and `complex`. The prototype is next, then hive-router.
+
+#### Query planning, 80 subgraphs
+
+200 iterations. Overhead p50 / p99 in ms. `hive-gateway` aborted with a V8 out-of-memory error during the measured iterations (813 of 2,012 requests succeeded, 40.4%). Its plan was traced before that, in `setup`, so the shape below is from a completed execution. Its overhead percentiles are only the requests that succeeded before the abort. On the Mac the same gateway finished at 84.5% success and did not abort.
+
+| Gateway | product_page | search | checkout | order_history | Success |
+| --- | --- | --- | --- | --- | --- |
+| grafbase | 5.5 / 6.8 | 2.8 / 4.0 | 0.83 / 2.1 | 1.6 / 3.2 | 100% |
+| **prototype-router (asap)** | 8.5 / 12.2 | 3.5 / 5.7 | 1.3 / 2.7 | 2.2 / 3.7 | 100% |
+| **prototype-router** | 15.6 / 22.6 | 5.3 / 9.2 | 1.8 / 4.7 | 3.2 / 5.4 | 100% |
+| hive-gateway | 124 / 651 | 57 / 367 | 29 / 264 | 51 / 412 | 40.4% |
+| apollo-router-v3-incremental | 151 / 188 | 70 / 92 | 26 / 35 | 63 / 82 | 100% |
+| hive-router | 313 / 375 | 63 / 83 | 15 / 20 | 27 / 32 | 100% |
+| hive-gateway-router-runtime | 380 / 444 | 89 / 137 | 24 / 43 | 39 / 57 | 100% |
+| apollo-router-v3 | 464 / 536 | 186 / 247 | 63 / 75 | 103 / 129 | 100% |
+| apollo-router | 467 / 542 | 188 / 279 | 63 / 78 | 104 / 122 | 100% |
+| apollo-gateway | 556 / 749 | 211 / 262 | 83 / 132 | 135 / 194 | 100% |
+| cosmo | 1,213 / 1,409 | 221 / 407 | 45 / 89 | 97 / 181 | 100% |
+
+Plan quality, sequential steps / subgraph requests:
+
+| Gateway | product_page | search | checkout | order_history |
+| --- | --- | --- | --- | --- |
+| **prototype-router** | 7 / 49 | 7 / 17 | 7 / 51 | 8 / 56 |
+| cosmo | 7 / 63 | 6 / 18 | 7 / 63 | 8 / 69 |
+| hive-router | 7 / 64 | 6 / 19 | 7 / 63 | 8 / 70 |
+| hive-gateway-router-runtime | 7 / 64 | 6 / 19 | 7 / 63 | 8 / 70 |
+| **prototype-router (asap)** | 7 / 64 | 6 / 19 | 7 / 65 | 8 / 72 |
+| grafbase | 7 / 92 | 6 / 39 | 7 / 97 | 8 / 127 |
+| apollo-router, apollo-router-v3, apollo-gateway | 10 / 100 | 6 / 59 | 9 / 78 | 8 / 127 |
+| hive-gateway | 11 / 72 | 7 / 19 | 14 / 70 | 11 / 75 |
+| apollo-router-v3-incremental | 13 / 91 | 7 / 47 | 14 / 72 | 8 / 113 |
+
+The prototype's plans match the Mac session. Grafbase's fetch counts moved by one or two (Mac was 7/91, 6/39, 7/99, 8/131); steps are inferred from request timing, and the trace keeps the shallowest of three runs. On this VM Grafbase's overhead was lower than `prototype-router (asap)` on every large query, including `product_page`, where the Mac session had asap ahead (6.1 ms vs Grafbase 8.1 ms). That is a different CPU, not a change in the plans.
+
+### Previous results, MacBook Pro
+
 The prototype rows were run on 2026-11-19 at commit `236ce71`; the other gateways' rows are from 2026-11-18. `prototype-router` is the default merge mode; `prototype-router (asap)` is `MERGE_MODE=asap`; The tables headed "dedupe off" were run for every gateway in one session on 2026-11-19.
 
 In short: it passes the whole compatibility audit, plans about as fast as Grafbase and faster than everything else, and sends the fewest subgraph requests of any gateway tested. Its throughput is the highest measured when identical concurrent queries share an execution, which is what the throughput benchmark sends; with dedupe turned off on every gateway it is also the highest, about 40% ahead of Hive Router at constant load and under stress.
